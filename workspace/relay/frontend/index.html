@@ -16,9 +16,15 @@
     <button data-tab="upload">回执上传</button>
     <button data-tab="retries">失败重试</button>
     <button data-tab="archive">归档封存</button>
+    <button data-tab="approvals">双人复核 <span id="todoBadge" class="todo-badge hidden">0</span></button>
+    <button data-tab="accounts">值班账号</button>
     <button data-tab="audit">审计与冲突</button>
     <button data-tab="stub" class="hidden">桩适配器</button>
   </nav>
+  <div class="identity">
+    <label>当前值班账号：</label>
+    <select id="userSelect"><option value="">（未登录）</option></select>
+  </div>
   <div class="health" id="health">连接中…</div>
 </header>
 
@@ -149,6 +155,85 @@
       <thead><tr><th>时间</th><th>原因</th><th>批次</th><th>序号</th><th>回执号</th><th>详情</th></tr></thead>
       <tbody id="conflictRows"></tbody>
     </table>
+  </section>
+
+  <!-- ============ 双人复核 ============ -->
+  <section id="tab-approvals" class="tab">
+    <h2>岗位权限与双人复核</h2>
+    <p class="hint">敏感指令（<b>执行包导入 / 失败重试 / 终态解除重投 / 批次封存</b>）
+      先形成带<b>资源版本</b>与<b>请求指纹</b>的待批事项，只能由<b>另一个</b>具备相应
+      岗位权限的账号在权限仍有效、目标状态未变化时批准；申请人不能自批。
+      账号停用、角色调整、资源变化或超时会使未决事项立即失效（已生效动作不回滚）。</p>
+
+    <h3>① 发起敏感指令申请</h3>
+    <div class="grid2">
+      <div>
+        <div class="row gap">
+          <select id="apAction">
+            <option value="package_import">执行包导入（需调度）</option>
+            <option value="manual_retry">失败重试（需调度）</option>
+            <option value="ack_terminal">终态解除重投（需调度）</option>
+            <option value="batch_seal">批次封存（需归档审查）</option>
+          </select>
+          <input id="apBatch" placeholder="batch_ref（批次号）" style="flex:1">
+          <input id="apSeq" placeholder="seq（重试/终态解除需要）" style="width:180px">
+        </div>
+        <textarea id="apPkgJson" rows="12"
+          placeholder='执行包导入时在此粘贴包 JSON：{"batch_ref":"...","batch_summary":"...","items":[...]}'></textarea>
+        <div class="row gap">
+          <input id="apNote" placeholder="申请备注（可选）" style="flex:1">
+          <button id="apSubmit" class="primary">提交申请（待另一账号复核）</button>
+        </div>
+      </div>
+      <div>
+        <h3>申请结果</h3>
+        <pre id="apResult" class="result">尚未申请</pre>
+      </div>
+    </div>
+
+    <div class="row between">
+      <h3>② 本人待办</h3>
+      <button id="apRefresh">刷新</button>
+    </div>
+    <div id="todoMine"></div>
+    <div id="todoReview"></div>
+
+    <h3>③ 已失效事项</h3>
+    <div id="invalidList"></div>
+
+    <h3>④ 完整决策记录（申请/批准/拒绝/失效/执行）</h3>
+    <table class="tbl">
+      <thead><tr><th>时间</th><th>事项</th><th>动作</th><th>决策</th><th>操作者</th><th>细节</th></tr></thead>
+      <tbody id="decisionRows"></tbody>
+    </table>
+
+    <h3>全部事项</h3>
+    <div id="approvalAll"></div>
+    <div id="approvalDetail" class="detail-panel hidden"></div>
+  </section>
+
+  <!-- ============ 值班账号 ============ -->
+  <section id="tab-accounts" class="tab">
+    <h2>值班账号与岗位权限</h2>
+    <p class="hint">三类权限：<span class="badge queued">观察 observe</span>
+      <span class="badge dispatching">调度 dispatch</span>
+      <span class="badge retry_wait">归档审查 archive_review</span>。
+      停用账号或收缩角色会使其名下未决事项<b>立即失效</b>。</p>
+    <div class="row between"><h3>账号列表</h3><button id="accRefresh">刷新</button></div>
+    <table class="tbl">
+      <thead><tr><th>账号</th><th>姓名</th><th>权限</th><th>状态</th><th>操作</th></tr></thead>
+      <tbody id="accountRows"></tbody>
+    </table>
+    <h3>新建 / 调整账号</h3>
+    <div class="row gap">
+      <input id="accUser" placeholder="账号 username" style="width:160px">
+      <input id="accName" placeholder="显示名" style="width:180px">
+      <label class="chk"><input type="checkbox" id="roleObserve" checked> 观察</label>
+      <label class="chk"><input type="checkbox" id="roleDispatch"> 调度</label>
+      <label class="chk"><input type="checkbox" id="roleArchive"> 归档审查</label>
+      <label class="chk"><input type="checkbox" id="accActive" checked> 启用</label>
+      <button id="accSave" class="primary">保存</button>
+    </div>
   </section>
 
   <!-- ============ 桩适配器控制台（演示） ============ -->

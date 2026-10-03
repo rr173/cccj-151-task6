@@ -45,6 +45,9 @@ class Forwarder:
 
     # ---- 生命周期 ----
     def start(self):
+        # 允许 stop() 后重新启动（测试冻结/恢复转发器用）：重置停机标志与唤醒事件
+        self._stop = False
+        self._wake = threading.Event()
         self._thread = threading.Thread(target=self._run, name="relay-forwarder",
                                         daemon=True)
         self._thread.start()
@@ -207,6 +210,9 @@ class Forwarder:
                           detail={"reason": result.code, "attempt": r["attempts"],
                                   "retry_after_seconds": round(delay, 2)})
             self.stats["retries"] += 1
+        # 任一回执终局（成功/终态拒绝/退避）都改变批次状态 → 资源版本 +1，
+        # 引用该批次的待批（重试/封存等）立即按目标状态已变化失效
+        self.db.mark_revision()
         self.db.commit()
         self.kick()  # 立即尝试下一个就绪序号（连续转发）
 
@@ -229,4 +235,5 @@ class Forwarder:
                           receipt_no=r["receipt_no"],
                           detail={"attempts": r["attempts"]})
         if rows:
+            self.db.mark_revision()
             self.db.commit()

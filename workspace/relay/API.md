@@ -3,6 +3,80 @@
 独立模块，仅依赖 Python 标准库。默认挂载前缀 `/relay`（页面 `/relay/`，接口 `/relay/api/...`）。
 所有写操作在全局锁内串行；后台转发器共用同一把锁。
 
+## 值班身份与岗位权限
+
+除现场终端接口（`/terminal/...`）与 `/health` 外，管理接口均需值班身份：
+请求头 `X-Relay-User: <username>`（或 JSON 字段 `_user`）。三类岗位权限：
+
+| 权限 | 含义 | 可操作 |
+|---|---|---|
+| `observe` 观察 | 只读 | 批次/队列/审计/归档/审批记录查看、回执上传 |
+| `dispatch` 调度 | 敏感指令（调度类） | 执行包导入、失败重试、终态解除重投（申请与批准） |
+| `archive_review` 归档审查 | 敏感指令（封存类） | 批次封存（申请与批准） |
+
+三类敏感指令**默认强制双人复核**（`RELAY_ENFORCE_APPROVALS=1`，默认开）：
+不再直接执行业务，而是先形成**待批事项**，由**另一个**具备相应权限的账号批准。
+关闭时（`=0`）恢复直调语义（兼容旧客户端/集成测试），此时不强制登录。
+
+### 账号管理
+- `GET /relay/api/accounts` — 账号与岗位列表。
+- `POST /relay/api/accounts`
+  `{"username","display_name?","roles":["observe","dispatch","archive_review"],"active?","note?"}`
+  新建或调整；**停用账号或收缩角色会使其名下未决事项立即失效**。
+  设置了环境变量 `RELAY_ADMIN_TOKEN` 时需请求头 `X-Relay-Admin-Token`。
+- `POST /relay/api/accounts/{username}/active` `{"active":true|false}`。
+- `GET /relay/api/me` — 当前身份、权限（未登录时返回可选账号提示）。
+
+首次启动自动播种演示账号：`zhang_obs`(观察)、`li_disp`/`wang_disp`(调度)、
+`zhao_arch`/`sun_arch`(归档审查)。
+
+### 双人复核（待批事项）
+
+待批事项 `approvals` 携带：
+- **请求指纹** `request_hash = sha256(canonical{action, params, requested_by})`：
+  同指纹重复申请返回同一事项（幂等）；
+- **资源版本** `resource_version = sha256(canonical(申请瞬间目标资源状态))`：
+  执行包维度（存在性/内容哈希/封存标记）；批次维度（游标 + 每条回执状态/结果码 + 封存标记）。
+
+接口：
+- `POST /relay/api/approvals` — 提交申请，体：
+  - `{"action":"package_import","package":{...},"note?"}`
+  - `{"action":"manual_retry","batch_ref","seq?","note?"}`
+  - `{"action":"ack_terminal","batch_ref","seq","note?"}`
+  - `{"action":"batch_seal","batch_ref","note?"}`
+  需对应岗位权限；201 新建、200 幂等重放。
+- `POST /relay/api/approvals/{id}/decide`
+  `{"decision":"approve|reject","note?"}` — 另一账号复核。
+
+批准前置（任一不满足即拒）：
+1. 事项仍 `pending`；批准人具备所需岗位；**批准人 ≠ 申请人**（`403 self_approval_forbidden`）；
+2. 申请人账号未停用且仍具所需权限（否则事项置 `invalid`，`409 approval_invalidated`）；
+3. 未超时（默认 15 分钟，`RELAY_APPROVAL_TTL`；原因 `timeout`）；
+4. **目标资源版本未变化**（否则置 `invalid`，原因 `resource_changed`）。
+
+语义保证：
+- 并发批准用 compare-and-swap（`UPDATE ... WHERE status='pending'`），
+  **只有一次生效并真正执行业务**，其它并发批准得到第一次结果的幂等回放；
+- 重复申请/重复批准均幂等；已 `executed/rejected` 的同指纹申请回放原事项；
+  已 `invalid/execute_failed` 的同指纹允许重提新事项（旧记录保留）；
+- 批准后在同一事务语义内调用**原业务函数**，不绕过任何业务校验：
+  业务拒绝（如不可封存、终态未解除、不可变冲突）→ 事项 `execute_failed`，
+  返回原状态码与错误码，业务侧零副作用；
+- 账号停用、角色调整、资源变化、超时使未决事项**立即失效但不回滚已生效动作**；
+- 全部过程写完整决策记录，服务重启后待办/失效/决策完整恢复。
+
+- `GET /relay/api/approvals/todo` — 本人待办：
+  `my_requests[]`（我申请未决）、`awaiting_my_review[]`（待我复核，非本人且有权限）。
+- `GET /relay/api/approvals?status=pending,invalid,executed,...&mine=1` — 事项列表
+  （含已失效事项；视图按当前身份标注 `can_approve`）。
+- `GET /relay/api/approvals/{id}` — 事项详情 + `decisions[]` 决策时间线。
+- `GET /relay/api/approval-decisions` — 完整决策记录
+  （`requested/approved/rejected/invalidated/executed/execute_failed`，只追加）。
+
+> 强制复核开启时，直接调用下面的敏感指令端点返回
+> **403 `approval_required`**（带申请/批准端点提示）。
+
+
 ## 顺序与恰好一次模型
 
 - 每个批次独立游标 `cursors.next_seq`（初始为执行包 `seq_base`，通常 1）。
@@ -17,8 +91,8 @@
 
 ## 管理/操作 API
 
-### 执行包导入（不可变、幂等）
-`POST /relay/api/packages/import`
+### 执行包导入（不可变、幂等；双人复核）
+`POST /relay/api/packages/import`（默认需先经 `/approvals` 双人复核，见上）
 ```json
 {"package": {"batch_ref":"B-001","batch_summary":"...","seq_base":1,
              "vehicle":{...},"destination":{...},"items":[...]}}
@@ -62,13 +136,15 @@
 | `seq > next_seq` | `buffered`，缺口补齐前不转发 |
 | `seq < next_seq` 且无原记录 | 409 `seq_behind_cursor` |
 
-### 队列 / 重试
+### 队列 / 重试（敏感指令，双人复核）
 - `GET /relay/api/queue` — 所有 queued/buffered/retry_wait/dispatching/终态拒绝行。
 - `POST /relay/api/retries` `{"batch_ref","seq?","note?"}`
-  — 把退避中的失败项立即重新入队；终态拒绝项返回 **409 terminal_requires_ack**。
+  — 默认需先经 `/approvals`（`action=manual_retry`）由另一调度账号批准；
+  批准后把退避中的失败项立即重新入队；终态拒绝项返回 **409 terminal_requires_ack**。
 - `POST /relay/api/batches/{ref}/receipts/{seq}/ack-terminal`
-  `{"note":"..."}` — **人工确认主系统终态已解除**（批次恢复/车辆或目的地改回）
-  后把终态拒绝项重投；全程审计，游标仍按序推进。
+  `{"note":"..."}` — 默认需经 `/approvals`（`action=ack_terminal`）双人复核；
+  **人工确认主系统终态已解除**（批次恢复/车辆或目的地改回）后把终态拒绝项重投；
+  全程审计，游标仍按序推进。
 
 ### 审计
 - `GET /relay/api/audit` — 审计流：导入/重放/冲突/派发/成功/退避重试/终态拒绝/
@@ -101,8 +177,10 @@
 不可封存时 `reasons[]` 逐条给出原因：`has_gaps`（含缺口序号）、
 `pending_queued/dispatching/retry_wait/buffered/rejected_terminal`。
 
-### 执行封存（幂等，单事务）
+### 执行封存（幂等，单事务；双人复核）
 `POST /relay/api/batches/{ref}/seal` `{"note?":"月底空间回收"}`
+默认需先经 `/approvals`（`action=batch_seal`）由另一归档审查账号批准；
+批准时重算封存资格与校验摘要，不绕过原封存校验。
 - 200：`{sealed:true, replay:false, digest, manifest, receipt_count, audit_count,
   freed_bytes, sealed_at}`；重复调用 → `replay:true` 并返回第一次结果。
 - 进行中批次 → **409 batch_not_sealable**（`reasons[]` 同预估接口）。
@@ -156,3 +234,6 @@
 `RELAY_CALLBACK_ADAPTER`(stub|http) `RELAY_CALLBACK_URL`
 `RELAY_CALLBACK_TIMEOUT`(8s) `RELAY_TICK_SECONDS`(1)
 `RELAY_LEASE_SECONDS`(30) `RELAY_BACKOFF_BASE`(1) `RELAY_BACKOFF_CAP`(60)
+`RELAY_ENFORCE_APPROVALS`(1，敏感指令强制双人复核；置 0 恢复直调且不强制登录)
+`RELAY_APPROVAL_TTL`(900 秒，未决事项有效期)
+`RELAY_ADMIN_TOKEN`(空=本地演示开放账号管理；非空时账号写接口需 X-Relay-Admin-Token)

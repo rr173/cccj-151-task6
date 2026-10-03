@@ -104,9 +104,11 @@ class ArchiveTests(unittest.TestCase):
         # 退避中的回执在查看瞬间可能正被重新派发，两种"未结束"都成立
         self.assertTrue(any(r["code"] in ("pending_retry_wait", "pending_dispatching")
                             for r in err["reasons"]))
-        # 终态阻塞同样不可封存
+        # 终态阻塞同样不可封存：先停后台再换规则，避免退避到期自动派发抢在人工重试前
+        self.h.app.forwarder.stop()
         self.h.configure({"B-001:1": "batch_withdrawn"}, reset_calls=False)
         self.h.call("POST", "/retries", {"batch_ref": "B-001", "seq": 1})
+        self.h.app.forwarder.start()
         self.h.wait_until(lambda: self.h.receipt_state("B-001", 1)[0]["state"]
                           == "rejected_terminal")
         code, err = self.h.call("POST", "/batches/B-001/seal", {},

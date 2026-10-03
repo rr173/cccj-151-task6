@@ -42,6 +42,10 @@ services:
       RELAY_LEASE_SECONDS: "30"
       RELAY_BACKOFF_BASE: "1"
       RELAY_BACKOFF_CAP: "60"
+      # 敏感指令双人复核（默认开启）；账号写接口可再挂 RELAY_ADMIN_TOKEN
+      RELAY_ENFORCE_APPROVALS: "1"
+      RELAY_APPROVAL_TTL: "900"
+      # RELAY_ADMIN_TOKEN: "change-me"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8090/relay/api/health',timeout=3).status==200 else 1)"]

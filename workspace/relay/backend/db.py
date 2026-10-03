@@ -112,7 +112,78 @@ CREATE TABLE IF NOT EXISTS archives(
 CREATE INDEX IF NOT EXISTS idx_receipts_dispatch
   ON receipts(state, next_retry_at);
 CREATE INDEX IF NOT EXISTS idx_receipts_batch ON receipts(batch_ref, seq);
+
+-- ============================================================
+-- 岗位权限与双人复核（值班操作审批流）
+--   * accounts      值班账号与三类岗位权限（observe/dispatch/archive_review）
+--   * approvals     敏感指令待批事项（带资源版本与请求指纹）
+--   * approval_decisions  完整决策记录（申请/批准/拒绝/失效/执行成败，只追加）
+-- ============================================================
+CREATE TABLE IF NOT EXISTS accounts(
+  username    TEXT PRIMARY KEY,
+  display_name TEXT NOT NULL DEFAULT '',
+  roles       TEXT NOT NULL DEFAULT '',   -- 逗号分隔: observe,dispatch,archive_review
+  active      INTEGER NOT NULL DEFAULT 1,
+  created_at  REAL NOT NULL,
+  updated_at  REAL NOT NULL,
+  note        TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS approvals(
+  id               TEXT PRIMARY KEY,        -- AP-<递增>-<hash8>
+  action           TEXT NOT NULL,           -- package_import|manual_retry|ack_terminal|batch_seal
+  request_hash     TEXT NOT NULL,           -- 请求指纹：canonical(动作+参数+申请人) 的 sha256
+  resource_ref     TEXT NOT NULL DEFAULT '',-- 目标资源（batch_ref；执行包导入为其 batch_ref）
+  resource_version TEXT NOT NULL DEFAULT '',-- 申请时目标状态版本（canonical sha256）
+  payload          TEXT NOT NULL,           -- 待执行指令原文 JSON
+  requested_by     TEXT NOT NULL,
+  requested_at     REAL NOT NULL,
+  status           TEXT NOT NULL,           -- pending|approved|rejected|invalid|executed|execute_failed
+  decided_by       TEXT NOT NULL DEFAULT '',
+  decided_at       REAL,
+  expires_at       REAL NOT NULL,
+  invalid_reason   TEXT NOT NULL DEFAULT '',
+  execution_result TEXT NOT NULL DEFAULT '',-- 批准后执行结果 JSON（幂等回放来源）
+  executed_at      REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status, requested_at);
+
+-- 完整决策记录：申请/批准/拒绝/失效/执行成功/执行失败各一行，只追加永不修改
+CREATE TABLE IF NOT EXISTS approval_decisions(
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts           REAL NOT NULL,
+  approval_id  TEXT NOT NULL,
+  action       TEXT NOT NULL DEFAULT '',
+  kind         TEXT NOT NULL,              -- requested|approved|rejected|invalidated|executed|execute_failed
+  actor        TEXT NOT NULL DEFAULT 'system',
+  detail       TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_decisions_approval
+  ON approval_decisions(approval_id, id);
 """
+
+# 三类岗位权限
+ROLES = ("observe", "dispatch", "archive_review")
+ROLE_LABELS = {
+    "observe": "观察", "dispatch": "调度", "archive_review": "归档审查",
+}
+# 敏感指令 → 申请所需权限 / 批准所需权限
+ACTION_ROLES = {
+    "package_import": "dispatch",
+    "manual_retry": "dispatch",
+    "ack_terminal": "dispatch",
+    "batch_seal": "archive_review",
+}
+ACTION_LABELS = {
+    "package_import": "执行包导入",
+    "manual_retry": "失败重试",
+    "ack_terminal": "终态解除重投",
+    "batch_seal": "批次封存",
+}
+# 默认待批事项有效期（秒）；可由 RELAY_APPROVAL_TTL 覆盖
+DEFAULT_APPROVAL_TTL = 15 * 60
 
 
 class RelayDB:
@@ -127,6 +198,12 @@ class RelayDB:
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.executescript(SCHEMA)
         self._migrate()
+        # 资源版本（revision）：资源变化的事务在提交前单调 +1；
+        # 提交前回调（precommit）据此让目标状态已变化的未决事项立即失效。
+        self._revision_dirty = False
+        self._approvals_created_tx = set()  # 本事务新建的待批事项（不被本事务失效）
+        self._approvals_executing = set()   # 正在批准执行的事项（其自身提交不失效它）
+        self.precommit = []                 # 回调列表 fn(db)->None，在提交前、锁内执行
         self.conn.commit()
 
     def _migrate(self):
@@ -137,6 +214,75 @@ class RelayDB:
                 "ALTER TABLE packages ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
         if "archived_at" not in cols:
             self.conn.execute("ALTER TABLE packages ADD COLUMN archived_at REAL")
+        self._migrate_approvals_unique()
+
+    def _migrate_approvals_unique(self):
+        """旧版 approvals.request_hash 带 UNIQUE；失效/执行失败后允许同指纹重提，
+        需要去掉唯一约束（SQLite 通过 建临时表→拷数据→换表 完成）。"""
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(approvals)")}
+        if not cols:
+            return  # 全新库（SCHEMA 建的表已无 UNIQUE）
+        need_rebuild = False
+        for idx in self.conn.execute("PRAGMA index_list(approvals)").fetchall():
+            if idx["unique"] and idx["origin"] == "u":
+                # 表级/列级 UNIQUE 自动索引（主键 origin='pk' 排除）
+                info = self.conn.execute(
+                    f"PRAGMA index_info({idx['name']})").fetchall()
+                if [i["name"] for i in info] == ["request_hash"]:
+                    need_rebuild = True
+                    break
+        if need_rebuild:
+            self.conn.executescript(
+                "ALTER TABLE approvals RENAME TO approvals_old_uniq;"
+                "CREATE TABLE approvals("
+                " id TEXT PRIMARY KEY, action TEXT NOT NULL,"
+                " request_hash TEXT NOT NULL, resource_ref TEXT NOT NULL DEFAULT '',"
+                " resource_version TEXT NOT NULL DEFAULT '', payload TEXT NOT NULL,"
+                " requested_by TEXT NOT NULL, requested_at REAL NOT NULL,"
+                " status TEXT NOT NULL, decided_by TEXT NOT NULL DEFAULT '',"
+                " decided_at REAL, expires_at REAL NOT NULL,"
+                " invalid_reason TEXT NOT NULL DEFAULT '',"
+                " execution_result TEXT NOT NULL DEFAULT '', executed_at REAL);"
+                "INSERT INTO approvals SELECT id,action,request_hash,resource_ref,"
+                "resource_version,payload,requested_by,requested_at,status,"
+                "decided_by,decided_at,expires_at,invalid_reason,execution_result,"
+                "executed_at FROM approvals_old_uniq;"
+                "DROP TABLE approvals_old_uniq;"
+                "CREATE INDEX IF NOT EXISTS idx_approvals_status"
+                " ON approvals(status, requested_at);")
+
+    # ---- 资源版本 / 事务钩子 ----
+    def revision(self):
+        """当前资源版本号（单调递增整数；全新库为 0）。"""
+        return int(self.get_meta("revision", "0") or 0)
+
+    def mark_revision(self):
+        """标记本事务改变了资源状态：提交时 revision +1 并触发未决事项失效检查。"""
+        self._revision_dirty = True
+
+    def approval_created(self, approval_id):
+        """登记本事务内新建的待批事项，使其不被本事务的资源变化失效。"""
+        self._approvals_created_tx.add(approval_id)
+
+    def commit(self):
+        # 资源版本先推进，再跑提交前回调（审批失效检查能读到新 revision）
+        if self._revision_dirty:
+            self.conn.execute(
+                "INSERT INTO meta(key,value) VALUES('revision',?1) "
+                "ON CONFLICT(key) DO UPDATE SET value=?1",
+                (str(self.revision() + 1),))
+        for fn in self.precommit:
+            fn(self)
+        self.conn.commit()
+        self._revision_dirty = False
+        self._approvals_created_tx = set()
+        self._approvals_executing = set()
+
+    def rollback(self):
+        self.conn.rollback()
+        self._revision_dirty = False
+        self._approvals_created_tx = set()
+        self._approvals_executing = set()
 
     # ---- meta ----
     def get_meta(self, key, default=None):
@@ -171,5 +317,11 @@ class RelayDB:
              reason, detail),
         )
 
-    def commit(self):
-        self.conn.commit()
+    def decision(self, approval_id, kind, actor="system", action="", detail=None):
+        """追加一条完整决策记录（只追加；审批流全过程留痕）。"""
+        self.conn.execute(
+            "INSERT INTO approval_decisions(ts,approval_id,action,kind,actor,detail)"
+            " VALUES(?,?,?,?,?,?)",
+            (time.time(), approval_id, action, kind, actor,
+             json.dumps(detail if detail is not None else {}, ensure_ascii=False)),
+        )

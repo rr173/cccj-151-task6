@@ -56,11 +56,13 @@ def wait_up(url, timeout=20):
     raise RuntimeError(f"服务未就绪: {url}")
 
 
-def req(base, method, path, body=None, expect_error=False):
+def req(base, method, path, body=None, expect_error=False, user=None):
     data = json.dumps(body).encode() if body is not None else None
-    r = urllib.request.Request(
-        base + path, data=data, method=method,
-        headers={"Content-Type": "application/json"} if data else {})
+    headers = {"Content-Type": "application/json"} if data else {}
+    if user:
+        headers["X-Relay-User"] = user
+    r = urllib.request.Request(base + path, data=data, method=method,
+                               headers=headers)
     try:
         with urllib.request.urlopen(r, timeout=10) as resp:
             return resp.status, json.loads(resp.read().decode())
@@ -114,11 +116,14 @@ def main():
             f"/api/plans/{plan['id']}/publish", {"commander": "张指挥"})
 
         # ---- 启动中继（真实 HTTP 适配器）----
+        # 集成测试聚焦双进程契约；敏感指令双人复核由 approval_test.py 覆盖，
+        # 这里关闭强制复核以保持既有直调流程。
         pr = start(os.path.join(RELAY_BACKEND, "server.py"), {
             "RELAY_PORT": str(RELAY_PORT), "RELAY_DB": relay_db,
             "RELAY_HOST": "127.0.0.1",
             "RELAY_CALLBACK_ADAPTER": "http",
             "RELAY_CALLBACK_URL": f"http://127.0.0.1:{MAIN_PORT}/api/relay-callback",
+            "RELAY_ENFORCE_APPROVALS": "0",
             "RELAY_TICK_SECONDS": "0.5",
             "RELAY_BACKOFF_BASE": "0.5"}, RELAY_BACKEND, "relay")
         procs.append(("relay", pr))
@@ -160,7 +165,7 @@ def main():
         ]})
 
         def b1_forwarded():
-            _, d = req(r, "GET", f"/batches/{b1['id']}")
+            _, d = req(r, "GET", f"/batches/{b1['id']}", user="zhang_obs")
             return d["counts"]["forwarded"] == 2 and d["cursor"] == 3
         wait_for(b1_forwarded, message="b1 两条回执连续转发")
 
@@ -194,14 +199,14 @@ def main():
         ]})
 
         def b2_blocked():
-            _, d = req(r, "GET", f"/batches/{b2['id']}")
+            _, d = req(r, "GET", f"/batches/{b2['id']}", user="zhang_obs")
             row1 = next(x for x in d["receipts"] if x["seq"] == 1)
             return (row1["state"] == "rejected_terminal"
                     and row1["result_code"] == "batch_withdrawn"
                     and d["cursor"] == 1
                     and {x["seq"] for x in d["buffered_items"]} == {2})
         wait_for(b2_blocked, message="b1 seq1 终态拒绝且 seq2 缓冲不越过")
-        _, d2 = req(r, "GET", f"/batches/{b2['id']}")
+        _, d2 = req(r, "GET", f"/batches/{b2['id']}", user="zhang_obs")
         check("中继批次状态 blocked_terminal", d2["status"] == "blocked_terminal")
 
         # ---- E. 中继重启：队列恢复且成功回调不重复 ----
@@ -225,6 +230,7 @@ def main():
             "RELAY_PORT": str(RELAY_PORT), "RELAY_DB": relay_db,
             "RELAY_HOST": "127.0.0.1", "RELAY_CALLBACK_ADAPTER": "http",
             "RELAY_CALLBACK_URL": f"http://127.0.0.1:{MAIN_PORT}/api/relay-callback",
+            "RELAY_ENFORCE_APPROVALS": "0",
             "RELAY_TICK_SECONDS": "0.5", "RELAY_BACKOFF_BASE": "0.5"},
             RELAY_BACKEND, "relay2")
         procs.append(("relay", pr2))
@@ -232,16 +238,16 @@ def main():
         r = f"http://127.0.0.1:{RELAY_PORT}/relay/api"
 
         # 重启后既有数据完整：b1 仍全转发、b2 仍阻塞
-        _, d1 = req(r, "GET", f"/batches/{b1['id']}")
+        _, d1 = req(r, "GET", f"/batches/{b1['id']}", user="zhang_obs")
         check("重启后 b1 转发计数保持 3", d1["cursor"] == 3)
-        _, d2b = req(r, "GET", f"/batches/{b2['id']}")
+        _, d2b = req(r, "GET", f"/batches/{b2['id']}", user="zhang_obs")
         check("重启后 b2 仍终态阻塞", d2b["status"] == "blocked_terminal")
 
         req(r, "POST", "/packages/import", {"package": pkg3})
         req(r, "POST", "/receipts/batch", {"batch_ref": b3["id"], "receipts": [
             {"seq": 1, "receipt_no": "RR-2001", "type": "departed",
              "batch_summary": pkg3["batch_summary"]}]})
-        wait_for(lambda: req(r, "GET", f"/batches/{b3['id']}")[1]
+        wait_for(lambda: req(r, "GET", f"/batches/{b3['id']}", user="zhang_obs")[1]
                  ["counts"]["forwarded"] == 1, message="重启实例继续转发 b3")
 
         time.sleep(1.0)  # 留出时间确认没有重复回调

@@ -109,6 +109,7 @@ def import_package(db, raw, actor="api", source=""):
     db.audit("package_imported", batch_ref, actor=actor,
              detail={"content_hash": content_hash, "package_id": package_id,
                      "items": len(raw.get("items", []))})
+    db.mark_revision()  # 新执行包落库 → 资源版本 +1，未决导入事项按新版本判定
     db.commit()
     return {"replay": False, "batch_ref": batch_ref, "content_hash": content_hash,
             "imported_at": t, "message": "执行包已不可变存档"}
@@ -245,6 +246,7 @@ def ingest_receipt(db, raw, actor="api", commit=True):
     db.audit("receipt_received", batch_ref, seq=seq, receipt_no=receipt_no, actor=actor,
              detail={"type": rtype, "state": state, "cursor": next_seq})
     if commit:
+        db.mark_revision()  # 新回执改变批次状态 → 引用该批次的未决事项失效
         db.commit()
     return {"seq": seq, "receipt_no": receipt_no, "state": state,
             "status": "accepted", "message": "回执已持久化"
@@ -294,7 +296,7 @@ def ingest_batch(db, body, actor="api"):
         db.commit()  # 全部入账成功才统一提交
     except RelayError as e:
         # 单条失败 → 回滚所有已插入回执/审计/冲突；另起事务仅留拒绝审计
-        db.conn.rollback()
+        db.rollback()
         failed_index = len(results)
         db.audit("receipt_batch_rejected", batch_ref, actor=actor,
                  detail={"code": e.code, "index": failed_index, "message": e.message})
@@ -302,6 +304,7 @@ def ingest_batch(db, body, actor="api"):
         raise RelayError(e.status, e.code,
                          f"批量上传被整体拒绝：{e.message}",
                          {"failed_item": e.extra, "index": failed_index})
+    db.mark_revision()
     return {"batch_ref": batch_ref, "count": len(results), "results": results}
 
 
@@ -491,6 +494,7 @@ def manual_retry(db, batch_ref, seq=None, actor="operator", note=""):
     if not changed:
         raise RelayError(409, "nothing_to_retry",
                          "匹配回执均不处于可重试状态（forwarded/buffered/queued）")
+    db.mark_revision()  # 回执重新入队 → 批次状态变化
     db.commit()
     return {"retried": changed, "message": f"已重新入队 {len(changed)} 条"}
 
@@ -516,6 +520,7 @@ def acknowledge_and_retry(db, batch_ref, seq, actor="operator", note=""):
     db.audit("terminal_ack_retry", batch_ref, seq=seq,
              receipt_no=r["receipt_no"], actor=actor,
              detail={"previous_reason": r["result_code"], "note": note})
+    db.mark_revision()  # 终态项重投 → 批次状态变化
     db.commit()
     return {"retried": [seq], "message": f"序号 {seq} 已在人工确认终态解除后重新入队"}
 
@@ -565,6 +570,9 @@ def recover_on_startup(db):
     db.audit("relay_started", detail={"recovered_leases": len(stale),
                                       "pending_rows": pending,
                                       "archive_repairs": repaired})
+    if stale or repaired:
+        # 租约回收/归档校正改变了批次状态 → 资源版本 +1
+        db.mark_revision()
     db.commit()
     return {"recovered_leases": len(stale), "pending_rows": pending,
             "archive_repairs": repaired}

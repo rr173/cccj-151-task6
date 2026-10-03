@@ -28,12 +28,13 @@ API 总览（详见 relay/API.md）：
 import json
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote, parse_qs
 
 import archive
+import approvals
 import core
 from adapters import build_adapter
-from db import RelayDB
+from db import RelayDB, ROLE_LABELS, ACTION_ROLES, ACTION_LABELS
 from forwarder import Forwarder
 
 FRONTEND_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -44,11 +45,24 @@ DB_PATH = os.environ.get(
 
 
 class RelayApp:
-    def __init__(self, db_path=None, adapter=None, auto_start=True, **fw_kwargs):
+    def __init__(self, db_path=None, adapter=None, auto_start=True,
+                 enforce_approvals=None, **fw_kwargs):
         self.db = RelayDB(db_path or DB_PATH)
         self.adapter = adapter or build_adapter()
+        # 敏感指令是否强制双人复核（默认开启；老测试经工厂关闭）
+        if enforce_approvals is None:
+            enforce_approvals = os.environ.get(
+                "RELAY_ENFORCE_APPROVALS", "1").strip().lower() not in ("0", "false", "no")
+        self.enforce_approvals = bool(enforce_approvals)
+        # 账号管理令牌：设置后管理账号需 X-Relay-Admin-Token；不设则本地演示开放
+        self.admin_token = os.environ.get("RELAY_ADMIN_TOKEN", "")
+        # 任何资源变化提交前，让目标状态已变化的未决事项立即失效
+        self.db.precommit.append(approvals.invalidate_on_precommit)
+        approvals.seed_default_accounts(self.db)
         self.forwarder = Forwarder(self.db, self.adapter, **fw_kwargs)
         rec = core.recover_on_startup(self.db)
+        rec["expired_approvals"] = approvals.expire_pending(self.db,
+                                                            sweep_approved=True)
         if auto_start:
             self.forwarder.start()
             self.forwarder.kick()
@@ -102,6 +116,38 @@ class Handler(BaseHTTPRequestHandler):
 
     def _bad_json(self):
         raise core.RelayError(400, "malformed", "请求体不是合法 JSON")
+
+    # ---- 身份与岗位 ----
+    def _username(self, body=None):
+        u = self.headers.get("X-Relay-User", "")
+        if not u and isinstance(body, dict):
+            u = str(body.get("_user", "") or "")
+        return str(u).strip()
+
+    def _current_user(self, a, body=None, required=True):
+        u = self._username(body)
+        if not u:
+            if required:
+                raise core.RelayError(401, "unauthenticated",
+                                      "缺少值班身份：请通过 X-Relay-User 请求头"
+                                      "或 _user 字段指定账号")
+            return None, u
+        return approvals.require_account(a.db, u), u
+
+    def _require_observe(self, a, body=None):
+        # 关闭复核的兼容模式（老测试/种子直连）不强制登录
+        if not a.enforce_approvals:
+            return None, self._username(body)
+        row, u = self._current_user(a, body)
+        approvals.require_role(row, "observe")
+        return row, u
+
+    def _check_admin_token(self, a):
+        if a.admin_token:
+            token = self.headers.get("X-Relay-Admin-Token", "")
+            if token != a.admin_token:
+                raise core.RelayError(403, "admin_token_required",
+                                      "账号管理需要有效的 X-Relay-Admin-Token")
 
     def _download(self, filename, obj):
         data = json.dumps(obj, ensure_ascii=False, indent=2).encode("utf-8")
@@ -173,18 +219,70 @@ class Handler(BaseHTTPRequestHandler):
     def _route_get(self, p):
         a = app()
         with a.db.lock:
+            approvals.expire_pending(a.db)
             if p == "/relay/api/health":
                 return self._json(200, {"ok": True, "adapter": a.adapter.name,
                                         "forwarder": a.forwarder.stats,
-                                        "startup": a.startup})
+                                        "startup": a.startup,
+                                        "enforce_approvals": a.enforce_approvals})
+            if p == "/relay/api/me":
+                row, u = self._current_user(a, required=False)
+                if not row:
+                    return self._json(200, {"authenticated": False,
+                                            "accounts": [x["username"]
+                                                         for x in approvals.list_accounts(a.db)]})
+                d = dict(row)
+                d["role_list"] = sorted(approvals.account_roles(row))
+                d["role_labels"] = [ROLE_LABELS.get(x, x) for x in d["role_list"]]
+                d["authenticated"] = True
+                return self._json(200, d)
+            if p == "/relay/api/accounts":
+                self._check_admin_token(a)
+                return self._json(200, {"accounts": approvals.list_accounts(a.db)})
+
+            # 以下管理接口均需「观察」权限（现场终端设备接口另行放行；兼容模式不强制）
+            if not (p == "/relay/api/terminal/manifest"
+                    or p.startswith("/relay/api/terminal/packages/")):
+                self._require_observe(a)
+
             if p == "/relay/api/batches":
-                return self._json(200, {"batches": core.list_batches(a.db)})
+                u = self._username()
+                return self._json(200, {
+                    "batches": core.list_batches(a.db),
+                    "approvals": {"pending": len(approvals.list_approvals(
+                        a.db, status="pending")),
+                                  "my_todo": (approvals.todo_for(a.db, u)["total"]
+                                              if u else 0)}})
             if p == "/relay/api/queue":
                 return self._json(200, core.queue_overview(a.db))
             if p == "/relay/api/audit":
                 return self._json(200, {"events": core.recent_audit(a.db)})
             if p == "/relay/api/conflicts":
                 return self._json(200, {"conflicts": core.recent_conflicts(a.db)})
+
+            if p == "/relay/api/approvals/todo":
+                _, u = self._current_user(a)
+                return self._json(200, approvals.todo_for(a.db, u))
+            if p == "/relay/api/approval-decisions":
+                return self._json(200, {"decisions": approvals.decisions(a.db)})
+            if p.startswith("/relay/api/approvals/"):
+                parts = p.strip("/").split("/")
+                if len(parts) == 4:
+                    row = approvals._get_pending(a.db, parts[3])
+                    view = approvals._view_by_row(a.db, row, viewer=self._username())
+                    view["decisions"] = approvals.decisions(a.db, parts[3])
+                    return self._json(200, view)
+            if p == "/relay/api/approvals":
+                qs = parse_qs(urlparse(self.path).query)
+                status = qs.get("status", [None])[0]
+                if status:
+                    status = status.split(",")
+                viewer = self._username()
+                only_mine = qs.get("mine", ["0"])[0] == "1"
+                items = approvals.list_approvals(
+                    a.db, viewer=viewer or None, status=status,
+                    requested_by=viewer if only_mine else None)
+                return self._json(200, {"approvals": items})
 
             if p == "/relay/api/admin/storage":
                 return self._json(200, archive.estimate_storage(a.db))
@@ -225,9 +323,50 @@ class Handler(BaseHTTPRequestHandler):
     def _route_post(self, p, body):
         a = app()
         body = body if isinstance(body, dict) else {}
+
+        # ---- 值班账号管理（设置了 admin token 时需 X-Relay-Admin-Token）----
+        if p == "/relay/api/accounts" or (
+                p.startswith("/relay/api/accounts/") and p.endswith("/active")):
+            with a.db.lock:
+                self._check_admin_token(a)
+                _, u = self._current_user(a, body)
+                if p == "/relay/api/accounts":
+                    res = approvals.upsert_account(
+                        a.db, str(body.get("username", "")),
+                        display_name=body.get("display_name"),
+                        roles=body.get("roles"), active=body.get("active"),
+                        note=body.get("note"), actor=u or "admin")
+                else:
+                    uname = p.strip("/").split("/")[3]
+                    res = approvals.set_active(a.db, uname, bool(body.get("active")),
+                                               actor=u or "admin")
+                return self._json(200, res)
+
+        # ---- 双人复核：申请 / 批准或拒绝 ----
+        if p == "/relay/api/approvals":
+            with a.db.lock:
+                approvals.expire_pending(a.db)
+                _, u = self._current_user(a, body)
+                res = approvals.request_approval(a.db, body, u)
+                a.forwarder.kick()
+                return self._json(201 if res.get("status") == "pending" and not
+                                  res.get("idempotent_replay") else 200, res)
+        if p.startswith("/relay/api/approvals/") and p.endswith("/decide"):
+            with a.db.lock:
+                approvals.expire_pending(a.db)
+                _, u = self._current_user(a, body)
+                ap_id = p.strip("/").split("/")[3]
+                res = approvals.decide_approval(
+                    a.db, ap_id, u, str(body.get("decision", "approve")),
+                    note=str(body.get("note", "")))
+                a.forwarder.kick()
+                return self._json(200, res)
+
         actor = str(body.get("_actor", "api"))
         with a.db.lock:
+            approvals.expire_pending(a.db)
             if p == "/relay/api/packages/import":
+                self._gate_sensitive(a, body, "package_import")
                 res = core.import_package(a.db, body.get("package", body),
                                           actor=actor, source=str(body.get("source", "api")))
                 a.forwarder.kick()
@@ -235,11 +374,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(status, res)
 
             if p == "/relay/api/receipts":
+                self._require_observe(a, body)
                 res = core.ingest_receipt(a.db, body, actor=actor)
                 a.forwarder.kick()
                 return self._json(200, res)
 
             if p.startswith("/relay/api/batches/") and p.endswith("/receipts"):
+                self._require_observe(a, body)
                 ref = p.strip("/").split("/")[3]
                 body = dict(body)
                 body.setdefault("batch_ref", ref)
@@ -247,11 +388,13 @@ class Handler(BaseHTTPRequestHandler):
                 a.forwarder.kick()
                 return self._json(200, res)
             if p == "/relay/api/receipts/batch":
+                self._require_observe(a, body)
                 res = core.ingest_batch(a.db, body, actor=actor)
                 a.forwarder.kick()
                 return self._json(200, res)
 
             if p == "/relay/api/retries":
+                self._gate_sensitive(a, body, "manual_retry")
                 res = core.manual_retry(a.db, str(body.get("batch_ref", "")),
                                         seq=body.get("seq"), actor=actor,
                                         note=str(body.get("note", "")))
@@ -259,12 +402,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, res)
 
             if p.startswith("/relay/api/batches/") and p.endswith("/seal"):
+                self._gate_sensitive(a, body, "batch_seal")
                 ref = p.strip("/").split("/")[3]
                 res = archive.seal_batch(a.db, ref, actor=actor,
                                          note=str(body.get("note", "")))
                 return self._json(200, res)
 
             if p.startswith("/relay/api/batches/") and p.endswith("/ack-terminal"):
+                self._gate_sensitive(a, body, "ack_terminal")
                 parts = p.strip("/").split("/")
                 ref, seq = parts[3], int(parts[5])
                 res = core.acknowledge_and_retry(
@@ -273,6 +418,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, res)
 
             if p == "/relay/api/admin/stub":
+                self._require_observe(a, body)
                 if a.adapter.name != "stub":
                     raise core.RelayError(409, "adapter_not_stub",
                                           f"当前适配器为 {a.adapter.name}，不可注入桩规则")
@@ -293,6 +439,31 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, core.recover_on_startup(a.db))
 
             raise core.RelayError(404, "not_found", "未知接口")
+
+    def _gate_sensitive(self, a, body, action):
+        """强制双人复核时，敏感指令必须经 /approvals 批准后由复核动作内部调用。
+
+        带 _bypass_approval=True 的调用来自批准执行通道（仍需有效观察身份）；
+        其余直调在 enforce_approvals 开启时一律 403 并提示申请路径。
+        关闭复核（老测试/兼容模式）时仅校验申请人岗位权限。
+        """
+        if body.get("_bypass_approval"):
+            self._require_observe(a, body)
+            return
+        if not a.enforce_approvals:
+            return  # 兼容模式（老测试/种子直连）：保持原直调行为
+        _, u = self._current_user(a, body)
+        row = approvals.require_account(a.db, u)
+        approvals.require_role(row, ACTION_ROLES[action])
+        if a.enforce_approvals:
+            raise core.RelayError(
+                403, "approval_required",
+                f"敏感指令「{ACTION_LABELS[action]}」必须双人复核：先 "
+                "POST /relay/api/approvals 提交申请，再由另一个具备权限的账号调用 "
+                "POST /relay/api/approvals/{id}/decide 批准后才会执行",
+                {"action": action, "required_role": ACTION_ROLES[action],
+                 "apply_endpoint": "/relay/api/approvals",
+                 "decide_endpoint_pattern": "/relay/api/approvals/{id}/decide"})
 
 
 def _terminal_manifest(a_db):

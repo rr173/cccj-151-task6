@@ -3,6 +3,15 @@ const $ = (id) => document.getElementById(id);
 const API = "/relay/api";
 let timer = null;
 let selectedBatch = null;
+let currentUser = localStorage.getItem("relay_user") || "";
+let enforceApprovals = true;
+let accountsCache = [];
+
+const ROLE_LABEL = { observe: "观察", dispatch: "调度", archive_review: "归档审查" };
+const AP_STATUS = {
+  pending: "待复核", approved: "已批准", rejected: "已拒绝",
+  invalid: "已失效", executed: "已执行", execute_failed: "执行被业务拒绝",
+};
 
 // ------------------------------------------------------------ 通用
 function toast(msg, kind = "") {
@@ -14,9 +23,11 @@ function toast(msg, kind = "") {
 }
 
 async function api(path, opts = {}) {
+  const headers = opts.body ? { "Content-Type": "application/json" } : {};
+  if (currentUser) headers["X-Relay-User"] = currentUser;
   const resp = await fetch(API + path, {
     method: opts.method || "GET",
-    headers: opts.body ? { "Content-Type": "application/json" } : {},
+    headers,
     body: opts.body ? JSON.stringify(opts.body) : undefined,
   });
   let data = null;
@@ -28,6 +39,38 @@ async function api(path, opts = {}) {
     throw err;
   }
   return data;
+}
+
+async function loadAccountsIntoSelector() {
+  try {
+    const d = await api("/accounts");
+    accountsCache = d.accounts;
+    const sel = $("userSelect");
+    const prev = currentUser;
+    sel.innerHTML = '<option value="">（未登录）</option>' +
+      d.accounts.map((a) => `<option value="${esc(a.username)}"${
+        a.username === prev ? " selected" : ""}${a.active ? "" : " disabled"}>
+        ${esc(a.display_name || a.username)}${a.active ? "" : "（已停用）"}</option>`)
+        .join("");
+    sel.value = prev;
+  } catch { /* 账号接口需要登录/令牌时静默 */ }
+}
+
+$("userSelect").addEventListener("change", async () => {
+  currentUser = $("userSelect").value;
+  localStorage.setItem("relay_user", currentUser);
+  await refreshAllViews();
+});
+
+async function myRoles() {
+  if (!currentUser) return new Set();
+  const a = accountsCache.find((x) => x.username === currentUser);
+  return new Set(a ? a.role_list : []);
+}
+
+function actionNeedsRole(action) {
+  return ({ package_import: "dispatch", manual_retry: "dispatch",
+            ack_terminal: "dispatch", batch_seal: "archive_review" })[action];
 }
 
 function fmtTs(ts) {
@@ -64,14 +107,40 @@ document.querySelectorAll(".topbar nav button").forEach((btn) => {
     if (btn.dataset.tab === "retries") loadQueue();
     if (btn.dataset.tab === "archive") loadArchiveTab();
     if (btn.dataset.tab === "audit") loadAudit();
+    if (btn.dataset.tab === "approvals") loadApprovalsTab();
+    if (btn.dataset.tab === "accounts") loadAccounts();
     if (btn.dataset.tab === "stub") loadStub();
   });
 });
+
+// ---- 敏感操作统一走双人复核 ----
+async function submitSensitive(action, params) {
+  if (!currentUser) {
+    toast("请先在右上角选择值班账号", "err");
+    throw new Error("未登录");
+  }
+  const roles = await myRoles();
+  const need = actionNeedsRole(action);
+  if (!roles.has(need)) {
+    toast(`该操作需要「${ROLE_LABEL[need]}」权限，当前账号没有`, "err");
+    throw new Error("无权限");
+  }
+  const d = await api("/approvals", { method: "POST", body: { action, ...params } });
+  if (d.idempotent_replay && d.status === "pending") {
+    toast(`已有相同待批事项 ${d.id}（幂等），等待另一账号复核`);
+  } else if (d.status === "pending") {
+    toast(`待批事项 ${d.id} 已创建，请切换另一账号在「双人复核」页批准`, "ok");
+  } else {
+    toast(`事项 ${d.id} 当前状态：${AP_STATUS[d.status] || d.status}`);
+  }
+  return d;
+}
 
 // ------------------------------------------------------------ 批次总览
 async function loadHealth() {
   try {
     const h = await api("/health");
+    enforceApprovals = h.enforce_approvals !== false;
     $("health").textContent =
       `适配器: ${h.adapter} | 派发 ${h.forwarder.dispatched} 成功 ${h.forwarder.acked} ` +
       `重试 ${h.forwarder.retries} 终态 ${h.forwarder.terminal} | 启动回收 ${h.startup.recovered_leases}`;
@@ -83,6 +152,17 @@ async function loadHealth() {
     $("health").textContent = "中继不可达";
     $("health").classList.add("bad");
   }
+  await loadAccountsIntoSelector();
+  if (currentUser) {
+    try {
+      const todo = await api("/approvals/todo");
+      const badge = $("todoBadge");
+      if (todo.total) {
+        badge.textContent = todo.total;
+        badge.classList.remove("hidden");
+      } else badge.classList.add("hidden");
+    } catch { /* ignore */ }
+  } else $("todoBadge").classList.add("hidden");
 }
 
 async function loadBatches() {
@@ -214,12 +294,19 @@ $("importBtn").onclick = async () => {
   try { pkg = JSON.parse($("pkgJson").value); }
   catch { $("importResult").textContent = "JSON 解析失败"; return; }
   try {
-    const r = await api("/packages/import", { method: "POST", body: { package: pkg } });
-    $("importResult").textContent = JSON.stringify(r, null, 2);
-    toast(r.replay ? "相同包再次导入：返回原结果（幂等）" : "执行包已不可变存档", "ok");
+    let r;
+    if (enforceApprovals) {
+      r = await submitSensitive("package_import", { package: pkg });
+      $("importResult").textContent = JSON.stringify(r, null, 2)
+        + "\n\n⚠️ 导入未执行：已形成待批事项，请切换另一调度账号到「双人复核」页批准。";
+    } else {
+      r = await api("/packages/import", { method: "POST", body: { package: pkg } });
+      $("importResult").textContent = JSON.stringify(r, null, 2);
+      toast(r.replay ? "相同包再次导入：返回原结果（幂等）" : "执行包已不可变存档", "ok");
+    }
     loadBatches();
   } catch (e) {
-    $("importResult").textContent = JSON.stringify(e.data || { error: e.message }, null, 2);
+    if (e.data) $("importResult").textContent = JSON.stringify(e.data, null, 2);
     toast(e.message, "err");
   }
 };
@@ -296,18 +383,25 @@ async function loadQueue() {
 
   $("queueRows").querySelectorAll("button").forEach((btn) => {
     btn.addEventListener("click", async () => {
-      const note = prompt("操作备注（将进入审计）：", "操作员现场确认") || "";
+      const note = prompt("操作备注（将进入审计与复核记录）：", "操作员现场确认") || "";
       try {
-        if (btn.dataset.act === "retry") {
+        if (enforceApprovals) {
+          const action = btn.dataset.act === "retry" ? "manual_retry" : "ack_terminal";
+          const params = btn.dataset.act === "retry"
+            ? { batch_ref: btn.dataset.ref, seq: Number(btn.dataset.seq), note }
+            : { batch_ref: btn.dataset.ref, seq: Number(btn.dataset.seq), note };
+          await submitSensitive(action, params);
+        } else if (btn.dataset.act === "retry") {
           await api("/retries", { method: "POST",
             body: { batch_ref: btn.dataset.ref, seq: Number(btn.dataset.seq), note } });
+          toast("已提交", "ok");
         } else {
           await api(`/batches/${encodeURIComponent(btn.dataset.ref)}/receipts/${btn.dataset.seq}/ack-terminal`,
             { method: "POST", body: { note } });
+          toast("已提交", "ok");
         }
-        toast("已提交", "ok");
         loadQueue(); loadBatches();
-      } catch (e) { toast(e.message, "err"); }
+      } catch (e) { if (e.data || e.status) toast(e.message, "err"); }
     });
   });
 }
@@ -358,14 +452,22 @@ async function loadArchiveTab() {
 }
 
 async function sealBatch(ref) {
-  const note = prompt(`确认封存批次 ${ref}？\n` +
-    "热库回执明细与审计时间线将迁入只读归档（不可撤销）。可附备注：", "定期空间回收");
+  const note = prompt(`确认申请封存批次 ${ref}？\n` +
+    "封存为敏感指令，将形成待批事项，由另一归档审查账号批准。可附备注：",
+    "定期空间回收");
   if (note === null) return;
   try {
-    const r = await api(`/batches/${encodeURIComponent(ref)}/seal`,
-      { method: "POST", body: { note } });
-    toast(r.replay ? "批次此前已封存，返回第一次结果"
-                   : `已封存 ${ref}，回收 ${fmtBytes(r.freed_bytes)}`, "ok");
+    if (enforceApprovals) {
+      const r = await submitSensitive("batch_seal", { batch_ref: ref, note });
+      if (r.status === "pending") {
+        document.querySelector('[data-tab="approvals"]').click();
+      }
+    } else {
+      const r = await api(`/batches/${encodeURIComponent(ref)}/seal`,
+        { method: "POST", body: { note } });
+      toast(r.replay ? "批次此前已封存，返回第一次结果"
+                     : `已封存 ${ref}，回收 ${fmtBytes(r.freed_bytes)}`, "ok");
+    }
     loadArchiveTab(); loadBatches();
   } catch (e) {
     const reasons = e.data && e.data.reasons
@@ -471,8 +573,204 @@ async function loadStub() {
   };
 }
 
+// ------------------------------------------------------------ 双人复核
+function apBadge(status) {
+  const cls = ({ pending: "queued", executed: "forwarded", rejected: "rejected_terminal",
+                 invalid: "buffered", approved: "dispatching",
+                 execute_failed: "rejected_terminal" })[status] || "";
+  return `<span class="badge ${cls}">${AP_STATUS[status] || status}</span>`;
+}
+
+function apCard(a, showActions) {
+  const p = a.payload_obj || {};
+  const target = a.action === "package_import"
+    ? esc(p.package && p.package.batch_ref || a.resource_ref)
+    : `${esc(a.resource_ref)}${p.seq != null ? " #" + p.seq : ""}`;
+  const expired = a.status === "pending" && a.expires_at < Date.now() / 1000;
+  const reason = a.status === "invalid"
+    ? `<div class="err-text" style="font-size:12px">失效原因：${esc(a.invalid_reason)}
+       （${fmtTs(a.decided_at)}）</div>` : "";
+  const execErr = a.status === "execute_failed" && a.execution_result_obj
+    ? `<div class="err-text" style="font-size:12px">业务拒绝：
+       ${esc(a.execution_result_obj.code)} — ${esc(a.execution_result_obj.error)}</div>` : "";
+  let actions = "";
+  if (showActions && a.can_approve) {
+    actions = `<div class="row gap" style="margin-top:8px">
+      <button data-decide="approve" data-id="${a.id}" class="primary">批准并执行</button>
+      <button data-decide="reject" data-id="${a.id}">拒绝</button></div>`;
+  }
+  return `<div class="card ap-card status-${a.status}">
+    <h4>${esc(a.action_label)} · ${target} ${apBadge(a.status)}
+      <span class="muted mono" style="font-size:11px">${esc(a.id)}</span></h4>
+    <div class="sub">申请人：<b>${esc(a.requested_by)}</b> · ${fmtTs(a.requested_at)}
+      ${a.decided_by ? ` · 决策人：<b>${esc(a.decided_by)}</b> · ${fmtTs(a.decided_at)}` : ""}
+      ${expired ? '<span class="err-text">· 已超时</span>' : ""}</div>
+    <div class="sub mono" style="font-size:11px">资源版本 ${esc((a.resource_version || "").slice(0, 16))}…
+      · 请求指纹 ${esc((a.request_hash || "").slice(0, 16))}…</div>
+    ${reason}${execErr}${actions}</div>`;
+}
+
+async function loadApprovalsTab() {
+  const [todo, inv, all, dec] = await Promise.all([
+    currentUser ? api("/approvals/todo") : Promise.resolve({ my_requests: [], awaiting_my_review: [] }),
+    api("/approvals?status=invalid").catch(() => ({ approvals: [] })),
+    api("/approvals").catch(() => ({ approvals: [] })),
+    api("/approval-decisions").catch(() => ({ decisions: [] })),
+  ]);
+
+  $("todoMine").innerHTML = todo.my_requests.length
+    ? todo.my_requests.map((a) => apCard(a, false)).join("")
+    : `<p class="muted">没有我发起的未决事项。</p>`;
+  $("todoReview").innerHTML = todo.awaiting_my_review.length
+    ? `<h4 style="margin:10px 0 6px">待我复核（非本人申请）</h4>` +
+      todo.awaiting_my_review.map((a) => apCard(a, true)).join("")
+    : "";
+  $("invalidList").innerHTML = inv.approvals.length
+    ? inv.approvals.map((a) => apCard(a, false)).join("")
+    : `<p class="muted">暂无已失效事项。</p>`;
+  $("approvalAll").innerHTML = all.approvals.length
+    ? `<div class="cards">${all.approvals.map((a) => apCard(a, false)).join("")}</div>`
+    : `<p class="muted">暂无事项。</p>`;
+  $("decisionRows").innerHTML = dec.decisions.map((e) => `<tr>
+    <td class="mono">${fmtTs(e.ts)}</td>
+    <td class="mono">${esc(e.approval_id)}</td>
+    <td>${esc(e.action)}</td>
+    <td><span class="badge ${e.kind === "executed" ? "forwarded"
+      : e.kind === "invalidated" || e.kind === "execute_failed" ? "rejected_terminal"
+      : e.kind === "rejected" ? "rejected_terminal" : "queued"}">${esc(e.kind)}</span></td>
+    <td>${esc(e.actor)}</td>
+    <td class="mono" style="max-width:480px;word-break:break-all">${esc(e.detail)}</td>
+  </tr>`).join("");
+
+  document.querySelectorAll("button[data-decide]").forEach((btn) =>
+    btn.addEventListener("click", () => decideApproval(btn.dataset.id, btn.dataset.decide)));
+  // 动作联动：导入时显示包输入框，其余显示批次/序号
+  syncApForm();
+}
+
+function syncApForm() {
+  const action = $("apAction").value;
+  const isImport = action === "package_import";
+  $("apPkgJson").parentNode.style.display = isImport ? "" : "none";
+  $("apBatch").style.display = isImport ? "none" : "";
+  $("apSeq").style.display = action === "manual_retry" || action === "ack_terminal" ? "" : "none";
+}
+$("apAction").addEventListener("change", syncApForm);
+
+$("apSubmit").onclick = async () => {
+  const action = $("apAction").value;
+  const note = $("apNote").value;
+  try {
+    let params;
+    if (action === "package_import") {
+      params = { package: JSON.parse($("apPkgJson").value) };
+    } else {
+      params = { batch_ref: $("apBatch").value.trim(), note };
+      const seq = $("apSeq").value.trim();
+      if (seq) params.seq = Number(seq);
+      if (action === "ack_terminal" && seq === "") throw new Error("终态解除重投必须填 seq");
+    }
+    const d = await submitSensitive(action, params);
+    $("apResult").textContent = JSON.stringify(d, null, 2);
+    await loadApprovalsTab();
+  } catch (e) {
+    $("apResult").textContent = (e.data ? JSON.stringify(e.data, null, 2) : "")
+      + `\n${e.message}`;
+    toast(e.message, "err");
+  }
+};
+
+async function decideApproval(id, decision) {
+  const note = prompt(decision === "approve"
+    ? `批准事项 ${id}？批准后立即在原有业务校验下执行。复核备注：`
+    : `拒绝事项 ${id}？拒绝理由：`, "双人复核");
+  if (note === null) return;
+  try {
+    const r = await api(`/approvals/${encodeURIComponent(id)}/decide`,
+      { method: "POST", body: { decision, note } });
+    toast(decision === "approve"
+      ? (r.status === "executed" ? "已批准并执行：" + (r.message || "")
+         : r.status === "execute_failed" ? "已批准，但业务校验拒绝执行"
+         : "决策已记录：" + r.status)
+      : "已拒绝", r.status === "executed" ? "ok" : "");
+    $("apResult").textContent = JSON.stringify(r, null, 2);
+  } catch (e) {
+    alert(`${e.message}\n${e.data ? JSON.stringify(e.data, null, 2) : ""}`);
+  }
+  await loadApprovalsTab();
+  loadBatches(); loadHealth();
+}
+$("apRefresh").onclick = loadApprovalsTab;
+
+// ------------------------------------------------------------ 值班账号
+async function loadAccounts() {
+  const d = await api("/accounts");
+  $("accountRows").innerHTML = d.accounts.map((a) => `<tr>
+    <td><b>${esc(a.username)}</b></td>
+    <td>${esc(a.display_name)}</td>
+    <td>${a.role_list.map((r) =>
+      `<span class="badge ${r === "observe" ? "queued" : r === "dispatch"
+        ? "dispatching" : "retry_wait"}">${ROLE_LABEL[r] || r}</span>`).join(" ")}</td>
+    <td>${a.active ? '<span class="badge forwarded">启用</span>'
+                    : '<span class="badge rejected_terminal">已停用</span>'}</td>
+    <td>
+      <button data-edit='${esc(JSON.stringify(a))}'>编辑</button>
+      <button data-toggle="${esc(a.username)}" data-active="${a.active ? 0 : 1}">
+        ${a.active ? "停用" : "启用"}</button>
+    </td></tr>`).join("");
+  $("accountRows").querySelectorAll("button[data-edit]").forEach((b) =>
+    b.addEventListener("click", () => {
+      const a = JSON.parse(b.dataset.edit);
+      $("accUser").value = a.username;
+      $("accName").value = a.display_name;
+      $("roleObserve").checked = a.role_list.includes("observe");
+      $("roleDispatch").checked = a.role_list.includes("dispatch");
+      $("roleArchive").checked = a.role_list.includes("archive_review");
+      $("accActive").checked = !!a.active;
+    }));
+  $("accountRows").querySelectorAll("button[data-toggle]").forEach((b) =>
+    b.addEventListener("click", async () => {
+      if (!confirm(`确认${b.dataset.active === "1" ? "启用" : "停用"}账号 ${b.dataset.toggle}？`
+        + (b.dataset.active === "0" ? "\n该账号名下未决事项将立即失效。" : ""))) return;
+      try {
+        await api(`/accounts/${encodeURIComponent(b.dataset.toggle)}/active`,
+          { method: "POST", body: { active: b.dataset.active === "1" } });
+        toast("账号状态已更新", "ok");
+        await loadAccounts(); await loadAccountsIntoSelector();
+      } catch (e) { toast(e.message, "err"); }
+    }));
+}
+
+$("accSave").onclick = async () => {
+  const roles = [];
+  if ($("roleObserve").checked) roles.push("observe");
+  if ($("roleDispatch").checked) roles.push("dispatch");
+  if ($("roleArchive").checked) roles.push("archive_review");
+  try {
+    const r = await api("/accounts", { method: "POST", body: {
+      username: $("accUser").value.trim(), display_name: $("accName").value.trim(),
+      roles, active: $("accActive").checked } });
+    toast(r.created ? "账号已创建" : `账号已调整；${(r.invalidated || []).length} 个未决事项失效`,
+      "ok");
+    await loadAccounts(); await loadAccountsIntoSelector();
+  } catch (e) { toast(e.message, "err"); }
+};
+$("accRefresh").onclick = loadAccounts;
+
 // ------------------------------------------------------------ 自动刷新
 $("refreshBtn").onclick = () => { loadBatches(); loadHealth(); };
+async function refreshAllViews() {
+  await loadHealth();
+  loadBatches();
+  const active = document.querySelector(".tab.active");
+  if (active) {
+    if (active.id === "tab-retries") loadQueue();
+    if (active.id === "tab-archive") loadArchiveTab();
+    if (active.id === "tab-audit") loadAudit();
+    if (active.id === "tab-approvals") loadApprovalsTab();
+    if (active.id === "tab-accounts") loadAccounts();
+  }
+}
 function armTimer() {
   clearInterval(timer);
   if ($("autoRefresh").checked) {
@@ -483,9 +781,12 @@ function armTimer() {
       if (active && active.id === "tab-retries") loadQueue();
       if (active && active.id === "tab-archive") loadArchiveTab();
       if (active && active.id === "tab-audit") loadAudit();
+      if (active && active.id === "tab-approvals") loadApprovalsTab();
     }, 2000);
   }
 }
 $("autoRefresh").onchange = armTimer;
 
-loadHealth(); loadBatches(); armTimer();
+loadHealth().then(loadBatches);
+armTimer();
+syncApForm();

@@ -58,14 +58,16 @@ def batch_upload(ref, receipts, summary=SUMMARY):
 class RelayServerHarness:
     """在随机端口上启动真实 HTTP 服务；temp DB；stub 适配器；快速转发器。"""
 
-    def __init__(self, db_path=None, adapter=None):
+    def __init__(self, db_path=None, adapter=None, enforce_approvals=False):
         self.tmp = None
         if db_path is None:
             self.tmp = tempfile.mkdtemp(prefix="relay-test-")
             db_path = os.path.join(self.tmp, "relay.db")
         self.db_path = db_path
         self.adapter = adapter or adapters.StubCallbackAdapter()
+        # 老测试直调敏感指令：默认关闭双人复核（复核语义由 approval_test.py 覆盖）
         self.app = srv.RelayApp(db_path=db_path, adapter=self.adapter,
+                                enforce_approvals=enforce_approvals,
                                 interval=0.02, lease_seconds=30,
                                 backoff_base=0.03, backoff_cap=0.5)
         srv.APP = self.app  # 让 HTTP Handler 使用本实例（临时库 + 桩适配器）
@@ -84,11 +86,16 @@ class RelayServerHarness:
             shutil.rmtree(self.tmp, ignore_errors=True)
 
     # ---- HTTP 帮助函数 ----
-    def call(self, method, path, body=None, expect_error=False):
+    def call(self, method, path, body=None, expect_error=False, user=None,
+             headers=None):
         data = json.dumps(body).encode() if body is not None else None
+        hdrs = {"Content-Type": "application/json"} if data else {}
+        if user:
+            hdrs["X-Relay-User"] = user
+        if headers:
+            hdrs.update(headers)
         req = urllib.request.Request(
-            self.base + path, data=data, method=method,
-            headers={"Content-Type": "application/json"} if data else {})
+            self.base + path, data=data, method=method, headers=hdrs)
         try:
             with urllib.request.urlopen(req, timeout=5) as resp:
                 return resp.status, json.loads(resp.read().decode())
@@ -97,6 +104,18 @@ class RelayServerHarness:
             if expect_error:
                 return e.code, payload
             raise AssertionError(f"{method} {path} -> {e.code}: {payload}")
+
+    # ---- 双人复核帮助函数：申请→（另一账号）批准，返回批准结果 ----
+    def approve_action(self, action, requester, approver, params, expect_error=False):
+        status, d = self.call("POST", "/approvals",
+                              {"action": action, **params}, user=requester,
+                              expect_error=expect_error)
+        if expect_error:
+            return status, d
+        ap_id = d["id"]
+        return self.call("POST", f"/approvals/{ap_id}/decide",
+                         {"decision": "approve", "note": "测试复核"},
+                         user=approver, expect_error=expect_error)
 
     def wait_until(self, fn, timeout=5, message=""):
         deadline = time.time() + timeout

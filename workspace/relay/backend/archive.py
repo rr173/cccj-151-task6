@@ -283,9 +283,10 @@ def seal_batch(db, batch_ref, actor="operator", note=""):
                  detail={"digest": digest, "receipt_count": len(receipts),
                          "audit_count": len(audit_rows),
                          "freed_bytes": usage["hot_bytes"], "note": note})
+        db.mark_revision()  # 封存改变批次状态 → 引用该批次的未决事项失效
         db.commit()
     except Exception:
-        db.conn.rollback()  # 不留半迁移状态：归档行/删除/标记同生共死
+        db.rollback()  # 不留半迁移状态：归档行/删除/标记同生共死
         raise
     arch = db.conn.execute("SELECT * FROM archives WHERE batch_ref=?",
                            (batch_ref,)).fetchone()
