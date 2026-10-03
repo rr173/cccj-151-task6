@@ -1,0 +1,54 @@
+services:
+  evac:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: evac-orchestrator:latest
+    container_name: evac-orchestrator
+    ports:
+      - "8080:8080"
+    volumes:
+      - evac-data:/app/data
+    environment:
+      EVAC_PORT: "8080"
+      EVAC_NO_SEED: "0"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/api/state',timeout=3).status==200 else 1)"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+
+  relay:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: fleet-receipt-relay:latest
+    container_name: fleet-receipt-relay
+    ports:
+      - "8090:8090"
+    depends_on:
+      evac:
+        condition: service_healthy
+    volumes:
+      - relay-data:/app/data
+    environment:
+      RELAY_PORT: "8090"
+      # 真实部署：HTTP 适配器回调主系统；离线演示可用 stub（页面内置桩控制台）
+      RELAY_CALLBACK_ADAPTER: "http"
+      RELAY_CALLBACK_URL: "http://evac:8080/api/relay-callback"
+      RELAY_CALLBACK_TIMEOUT: "8"
+      RELAY_TICK_SECONDS: "1"
+      RELAY_LEASE_SECONDS: "30"
+      RELAY_BACKOFF_BASE: "1"
+      RELAY_BACKOFF_CAP: "60"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8090/relay/api/health',timeout=3).status==200 else 1)"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  evac-data:
+  relay-data:

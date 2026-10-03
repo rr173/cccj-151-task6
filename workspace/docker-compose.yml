@@ -1,0 +1,23 @@
+services:
+  evac:
+    build: .
+    image: evac-orchestrator:latest
+    container_name: evac-orchestrator
+    ports:
+      - "8080:8080"
+    volumes:
+      # 持久化 SQLite：进程/容器重启后命令、出发记录与剩余容量完整恢复
+      - evac-data:/app/data
+    environment:
+      EVAC_PORT: "8080"
+      # 设为 1 可关闭启动时自动播种演示数据
+      EVAC_NO_SEED: "0"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/api/state',timeout=3).status==200 else 1)"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  evac-data:

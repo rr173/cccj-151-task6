@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>离线车队回执中继</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">🛰️ 离线车队回执中继</div>
+  <nav>
+    <button data-tab="dashboard" class="active">批次总览</button>
+    <button data-tab="import">执行包导入</button>
+    <button data-tab="terminal">现场终端下载</button>
+    <button data-tab="upload">回执上传</button>
+    <button data-tab="retries">失败重试</button>
+    <button data-tab="archive">归档封存</button>
+    <button data-tab="audit">审计与冲突</button>
+    <button data-tab="stub" class="hidden">桩适配器</button>
+  </nav>
+  <div class="health" id="health">连接中…</div>
+</header>
+
+<main>
+  <!-- ============ 批次总览 ============ -->
+  <section id="tab-dashboard" class="tab active">
+    <div class="row between">
+      <h2>批次总览</h2>
+      <div>
+        <label class="chk"><input type="checkbox" id="autoRefresh" checked> 每 2 秒刷新</label>
+        <button id="refreshBtn">刷新</button>
+      </div>
+    </div>
+    <p class="hint">每个批次显示：序号缺口、缓冲项、转发结果与失败原因；
+      <b>终态拒绝</b>（批次已撤回/车辆或目的地变化）会冻结游标，后续回执无法越过。</p>
+    <div id="batchCards" class="cards"></div>
+    <div id="batchDetail" class="detail-panel hidden"></div>
+  </section>
+
+  <!-- ============ 执行包导入 ============ -->
+  <section id="tab-import" class="tab">
+    <h2>执行包导入（不可变存档）</h2>
+    <p class="hint">完全相同的包再次导入返回原结果（幂等）；同 <code>batch_ref</code>
+      内容不同将被拒绝并记冲突，原包永不覆盖。</p>
+    <div class="grid2">
+      <div>
+        <h3>粘贴执行包 JSON</h3>
+        <textarea id="pkgJson" rows="20" placeholder='{"batch_ref":"B-001","batch_summary":"...","seq_base":1,"items":[...]}'></textarea>
+        <div class="row gap">
+          <button id="importBtn" class="primary">导入执行包</button>
+          <button id="loadSampleBtn">填入示例包</button>
+        </div>
+      </div>
+      <div>
+        <h3>导入结果</h3>
+        <pre id="importResult" class="result">尚未导入</pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 现场终端 ============ -->
+  <section id="tab-terminal" class="tab">
+    <h2>现场终端下载</h2>
+    <p class="hint">离线现场从这里下载不可变批次包；下载内容带内容哈希，重复下载字节一致。</p>
+    <table class="tbl">
+      <thead><tr><th>批次</th><th>摘要</th><th>内容哈希</th><th>已转发回执</th><th>导入时间</th><th>操作</th></tr></thead>
+      <tbody id="terminalRows"></tbody>
+    </table>
+    <pre id="terminalPkg" class="result hidden"></pre>
+  </section>
+
+  <!-- ============ 回执上传 ============ -->
+  <section id="tab-upload" class="tab">
+    <h2>批量回执上传</h2>
+    <p class="hint">回执类型：<code>departed 已离场</code>、
+      <code>failed_to_depart 未能出发</code>、<code>arrived 到达确认</code>。
+      乱序可传（缺口会缓冲）；完全相同的重传返回原结果；同序号或同回执编号但内容不同将被拒绝。</p>
+    <div class="grid2">
+      <div>
+        <h3>上传内容</h3>
+        <textarea id="rcptJson" rows="18"
+          placeholder='{"batch_ref":"B-001","batch_summary":"...","receipts":[{"seq":1,"receipt_no":"R-0001","type":"departed","batch_summary":"...","at":"2026-10-02T08:00:00Z"}]}'></textarea>
+        <div class="row gap">
+          <button id="uploadBtn" class="primary">上传</button>
+          <button id="outOfOrderSampleBtn">填入乱序示例(1,3)</button>
+        </div>
+      </div>
+      <div>
+        <h3>上传结果</h3>
+        <pre id="uploadResult" class="result">尚未上传</pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 失败重试 ============ -->
+  <section id="tab-retries" class="tab">
+    <h2>待转发队列与失败重试</h2>
+    <p class="hint">回调超时/网络错误会指数退避自动重试，可在此立即重试；
+      终态拒绝默认不可越过，只有主系统确认已解除（批次恢复/车辆或目的地改回）后才能人工确认重投。</p>
+    <div class="row gap"><button id="queueRefresh">刷新队列</button></div>
+    <table class="tbl">
+      <thead><tr><th>批次</th><th>序号</th><th>回执号</th><th>类型</th><th>状态</th>
+        <th>尝试</th><th>失败原因 / 结果</th><th>下次重试</th><th>操作</th></tr></thead>
+      <tbody id="queueRows"></tbody>
+    </table>
+  </section>
+
+  <!-- ============ 归档封存 ============ -->
+  <section id="tab-archive" class="tab">
+    <h2>磁盘空间回收：批次封存与只读归档</h2>
+    <p class="hint">只允许封存<b>无缺口、无待重试/阻塞项且全部回执已结束</b>的批次。
+      封存时生成内容清单与校验摘要，热库明细迁入只读归档；同一批次重复封存返回第一次结果；
+      进行中的批次或校验失败会被拒绝；归档记录永不再次进入转发队列，原审计时间线随归档保留。</p>
+    <div class="row between">
+      <h3 style="margin:0">热库占用预估</h3>
+      <button id="storageRefresh">刷新</button>
+    </div>
+    <div id="storageTotals" class="metrics" style="margin:10px 0"></div>
+    <table class="tbl">
+      <thead><tr><th>批次</th><th>回执明细</th><th>审计行</th><th>热库占用</th>
+        <th>封存资格</th><th>操作</th></tr></thead>
+      <tbody id="storageRows"></tbody>
+    </table>
+    <h3>只读归档</h3>
+    <table class="tbl">
+      <thead><tr><th>批次</th><th>校验摘要</th><th>回执</th><th>审计行</th>
+        <th>回收空间</th><th>封存时间</th><th>操作</th></tr></thead>
+      <tbody id="archiveRows"></tbody>
+    </table>
+    <div id="archiveDetail" class="detail-panel hidden"></div>
+  </section>
+
+  <!-- ============ 审计 ============ -->
+  <section id="tab-audit" class="tab">
+    <h2>审计流与冲突记录</h2>
+    <div class="row gap">
+      <button id="auditRefresh">刷新</button>
+      <a class="btnlike" href="/relay/api/audit" target="_blank">GET /api/audit</a>
+      <a class="btnlike" href="/relay/api/conflicts" target="_blank">GET /api/conflicts</a>
+    </div>
+    <h3>审计事件</h3>
+    <table class="tbl">
+      <thead><tr><th>时间</th><th>事件</th><th>批次</th><th>序号</th><th>回执号</th><th>操作者</th><th>细节</th></tr></thead>
+      <tbody id="auditRows"></tbody>
+    </table>
+    <h3>被拒冲突（不推进游标）</h3>
+    <table class="tbl">
+      <thead><tr><th>时间</th><th>原因</th><th>批次</th><th>序号</th><th>回执号</th><th>详情</th></tr></thead>
+      <tbody id="conflictRows"></tbody>
+    </table>
+  </section>
+
+  <!-- ============ 桩适配器控制台（演示） ============ -->
+  <section id="tab-stub" class="tab">
+    <h2>桩回调适配器控制台（离线演示）</h2>
+    <p class="hint">仅当适配器为 <code>stub</code> 时可用。规则键：
+      <code>B-001:3</code> / <code>B-001:*</code> / <code>*</code>；
+      值：<code>ack</code>、<code>timeout</code>、<code>http_503</code>、
+      <code>batch_withdrawn</code>、<code>vehicle_changed</code>、
+      <code>destination_changed</code>、<code>fail_then_ok</code>。</p>
+    <div id="stubPanel"></div>
+  </section>
+</main>
+
+<div id="toast" class="toast hidden"></div>
+<script src="app.js"></script>
+</body>
+</html>

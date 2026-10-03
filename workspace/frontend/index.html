@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>山火应急撤离编排系统</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div id="ctxBar" class="ctx-bar live"></div>
+<header>
+  <div class="brand">🔥 山火应急撤离编排</div>
+  <nav>
+    <button data-tab="map" class="tab active">作战地图</button>
+    <button data-tab="batches" class="tab">撤离批次</button>
+    <button data-tab="plans" class="tab">方案比较与发布</button>
+    <button data-tab="sandbox" class="tab sandbox-tab">🧪 推演沙盒</button>
+    <button data-tab="resources" class="tab">资源与导入</button>
+    <button data-tab="households" class="tab">受威胁住户</button>
+    <button data-tab="log" class="tab">事件日志</button>
+  </nav>
+  <div class="revbox">
+    <span>修订号 <b id="revision">–</b></span>
+    <span id="revWarn" class="rev-warn" hidden>数据已更新</span>
+    <button id="refreshBtn" class="mini">刷新</button>
+  </div>
+</header>
+
+<main>
+  <!-- ============ 地图 ============ -->
+  <section id="tab-map" class="tabpanel active">
+    <div class="layout">
+      <div class="card map-card">
+        <div class="legend">
+          <span><i class="dot grid-threat"></i>受威胁网格</span>
+          <span><i class="dot grid-safe"></i>安全网格</span>
+          <span><i class="dot shelter-dot"></i>避难点</span>
+          <span><i class="line-leg open"></i>开放道路</span>
+          <span><i class="line-leg closed"></i>已封闭</span>
+          <span id="waveLegend"></span>
+        </div>
+        <svg id="map" viewBox="0 0 10.8 5.6" preserveAspectRatio="xMidYMid meet"></svg>
+        <div class="map-hint">点击道路可封闭/恢复；批次路线按波次着色，实线＝已离场（承诺），虚线＝待出发</div>
+      </div>
+      <div class="card side">
+        <h3>床位占用</h3>
+        <div id="capList"></div>
+        <h3>车辆</h3>
+        <div id="vehList"></div>
+        <h3>态势变更（仅影响未出发批次）</h3>
+        <div class="incident-grid">
+          <select id="roadSel"></select>
+          <button id="roadCloseBtn" class="danger mini">封闭道路</button>
+          <button id="roadOpenBtn" class="mini">恢复道路</button>
+          <select id="vehSel"></select>
+          <button id="vehDownBtn" class="danger mini">车辆故障</button>
+          <button id="vehRecoverBtn" class="mini">车辆修复</button>
+          <select id="shelSel"></select>
+          <button id="shelSuspendBtn" class="danger mini">暂停接收</button>
+          <button id="shelResumeBtn" class="mini">恢复接收</button>
+          <select id="gridSel"></select>
+          <button id="fireBtn" class="danger mini">火线扩大至此</button>
+          <button id="fireClearBtn" class="mini">网格解除威胁</button>
+        </div>
+        <div id="ctxWriteNote" class="ctx-write-note" hidden>
+          🧪 当前为推演分支：以上态势变更只写入分支，不会影响实战；
+          可在「推演沙盒」页查看并排差异并把资源改动提升回实战。
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 批次 ============ -->
+  <section id="tab-batches" class="tabpanel">
+    <div class="card">
+      <div class="row-between">
+        <h2>撤离批次与承诺状态</h2>
+        <div><button id="replanBtn" class="primary">基于最新态势生成候选方案</button></div>
+      </div>
+      <p class="muted">车辆点击「确认离场」后，该批次与其目的地床位占用即视为<b>已承诺</b>：
+        之后任何重新规划都不会改派已出发家庭或释放其床位；同一车辆的后续未出发批次会被撤回待重排。</p>
+      <div id="batchArea"></div>
+    </div>
+  </section>
+
+  <!-- ============ 方案 ============ -->
+  <section id="tab-plans" class="tabpanel">
+    <div class="card">
+      <div class="row-between">
+        <h2>候选方案比较</h2>
+        <div>
+          指挥员 <input id="commander" placeholder="姓名/代号" class="inp small">
+          <button id="planBtn" class="primary">生成候选方案</button>
+        </div>
+      </div>
+      <div id="planCompare"></div>
+    </div>
+    <div class="card" id="planDetailCard" hidden>
+      <div class="row-between">
+        <h2 id="planDetailTitle">方案详情</h2>
+        <div>
+          <button id="publishBtn" class="publish">发布分区撤离令</button>
+          <button id="closeDetail" class="mini">关闭</button>
+        </div>
+      </div>
+      <div id="publishMsg"></div>
+      <div id="planDetail"></div>
+    </div>
+  </section>
+
+  <!-- ============ 推演沙盒 ============ -->
+  <section id="tab-sandbox" class="tabpanel">
+    <div class="card">
+      <div class="row-between">
+        <h2>🧪 推演沙盒 — 分支管理</h2>
+        <div>
+          <input id="newBranchName" placeholder="分支名称，如：r5封路+S4恢复" class="inp" style="width:260px">
+          <button id="createBranchBtn" class="primary">从当前实战态势复制为推演分支</button>
+        </div>
+      </div>
+      <p class="muted">创建时完整复制当前实战态势作为<b>创建基线</b>；之后实战与推演各自推进、互不影响。
+        分支内可连续模拟封路、车辆故障、避难点变化、规划发布与车辆离场，所有写入只进分支独立数据库。</p>
+      <div id="branchList"></div>
+    </div>
+
+    <div class="card" id="diffCard" hidden>
+      <div class="row-between">
+        <h2 id="diffTitle">分支 vs 实战 — 并排差异</h2>
+        <div>
+          <button id="enterBranchBtn" class="primary">进入该分支推演</button>
+          <button id="promoteBtn" class="publish">提升资源改动到实战</button>
+          <button id="discardBtn" class="danger mini">废弃分支</button>
+        </div>
+      </div>
+      <div id="promoteMsg"></div>
+      <div class="diff-meta" id="diffMeta"></div>
+
+      <h3>资源字段三方差异（base / 实战 / 推演）</h3>
+      <div class="diff-table-wrap"><table class="grid-table diff-table" id="fieldDiffTable"></table></div>
+
+      <div class="side-grid">
+        <div>
+          <h3 class="live-h">实战 — 人员去向</h3>
+          <div class="diff-table-wrap"><table class="grid-table diff-table" id="peopleLiveTable"></table></div>
+        </div>
+        <div>
+          <h3 class="branch-h">推演 — 人员去向</h3>
+          <div class="diff-table-wrap"><table class="grid-table diff-table" id="peopleBranchTable"></table></div>
+        </div>
+      </div>
+
+      <div class="side-grid">
+        <div>
+          <h3 class="live-h">实战 — 资源余量（床位）</h3>
+          <div class="diff-table-wrap"><table class="grid-table diff-table" id="capLiveTable"></table></div>
+        </div>
+        <div>
+          <h3 class="branch-h">推演 — 资源余量（床位）</h3>
+          <div class="diff-table-wrap"><table class="grid-table diff-table" id="capBranchTable"></table></div>
+        </div>
+      </div>
+
+      <div class="side-grid">
+        <div>
+          <h3 class="live-h">实战 — 受阻原因（最新方案诊断）</h3>
+          <div id="blockerLive"></div>
+        </div>
+        <div>
+          <h3 class="branch-h">推演 — 受阻原因（最新方案诊断）</h3>
+          <div id="blockerBranch"></div>
+        </div>
+      </div>
+
+      <h3>分支审计记录</h3>
+      <div id="branchAudit"></div>
+    </div>
+  </section>
+
+  <!-- ============ 资源 ============ -->
+  <section id="tab-resources" class="tabpanel">
+    <div class="card" id="resourcesPanel">
+      <h2>资源导入（重复导入按编号覆盖/去重，不产生重复记录）</h2>
+      <div class="import-grid">
+        <div>
+          <h3>网格 / 道路 / 避难点 / 车辆 JSON</h3>
+          <select id="importKind">
+            <option value="grids">受威胁网格</option>
+            <option value="roads">道路</option>
+            <option value="shelters">避难点</option>
+            <option value="vehicles">车辆</option>
+          </select>
+          <textarea id="importJson" rows="10"></textarea>
+          <button id="importBtn" class="primary">导入</button>
+        </div>
+        <div class="muted" id="importHelp"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 住户 ============ -->
+  <section id="tab-households" class="tabpanel">
+    <div class="card" id="householdsPanel">
+      <h2>受威胁住户登记</h2>
+      <div class="form-inline">
+        <input id="hRef" placeholder="户号*" class="inp small">
+        <input id="hName" placeholder="户主/称呼" class="inp small">
+        <select id="hGrid"></select>
+        <input id="hMembers" type="number" min="1" value="3" title="人数" class="inp xs">
+        <label><input type="checkbox" id="hMobility"> 行动辅助</label>
+        <input id="hPets" type="number" min="0" value="0" title="宠物数" class="inp xs">
+        <input id="hContact" placeholder="联络方式" class="inp">
+        <button id="hAdd" class="primary">登记</button>
+      </div>
+      <p class="muted">同户号重复导入将被忽略（不会重复登记，也不会覆盖已有登记）。</p>
+      <table class="grid-table" id="hhTable"></table>
+    </div>
+  </section>
+
+  <!-- ============ 日志 ============ -->
+  <section id="tab-log" class="tabpanel">
+    <div class="card">
+      <div class="row-between">
+        <h2>事件与审计日志</h2>
+        <button id="resetBtn" class="danger mini">重置为演示数据</button>
+      </div>
+      <div id="logList"></div>
+    </div>
+  </section>
+</main>
+
+<div id="toast"></div>
+<script src="/app.js"></script>
+</body>
+</html>
