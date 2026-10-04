@@ -27,6 +27,7 @@ sys.path.insert(0, os.path.join(HERE, "..", "backend"))
 sys.path.insert(0, HERE)
 
 import archive  # noqa: E402
+import core  # noqa: E402
 from test_relay import (  # noqa: E402
     RelayServerHarness, SUMMARY, batch_upload, package, receipt)
 
@@ -40,7 +41,8 @@ def canonical_sha256(obj):
 class ArchiveTests(unittest.TestCase):
     def setUp(self):
         self.h = RelayServerHarness()
-        self.h.call("POST", "/packages/import", {"package": package()})
+        with self.h.app.db.lock:
+            core.import_package(self.h.app.db, package(), actor="test-setup")
         self.h.configure({"*": "ack"})
 
     def tearDown(self):
@@ -81,7 +83,7 @@ class ArchiveTests(unittest.TestCase):
         self.h.wait_until(lambda: self.h.receipt_state("B-001", 1)[0]["state"]
                           == "forwarded")
         code, err = self.h.call("POST", "/batches/B-001/seal", {},
-                                expect_error=True)
+                                expect_error=True, sensitive=True)
         self.assertEqual(code, 409)
         self.assertEqual(err["code"], "batch_not_sealable")
         codes = {r["code"] for r in err["reasons"]}
@@ -99,21 +101,37 @@ class ArchiveTests(unittest.TestCase):
         self.h.wait_until(lambda: self.h.receipt_state("B-001", 1)[0]["state"]
                           == "retry_wait")
         code, err = self.h.call("POST", "/batches/B-001/seal", {},
-                                expect_error=True)
+                                expect_error=True, sensitive=True)
         self.assertEqual(err["code"], "batch_not_sealable")
         # 退避中的回执在查看瞬间可能正被重新派发，两种"未结束"都成立
         self.assertTrue(any(r["code"] in ("pending_retry_wait", "pending_dispatching")
                             for r in err["reasons"]))
+        # 暂停后台转发，避免审批期间目标状态自行变化；审批后再恢复以产生终态。
+        self.h.app.forwarder.stop()
         # 终态阻塞同样不可封存
         self.h.configure({"B-001:1": "batch_withdrawn"}, reset_calls=False)
-        self.h.call("POST", "/retries", {"batch_ref": "B-001", "seq": 1})
+        self.h.call("POST", "/retries", {"batch_ref": "B-001", "seq": 1},
+                    sensitive=True)
+        self.h.app.forwarder.stop()
+        self.h.configure({"B-001:1": "batch_withdrawn"}, reset_calls=False)
+        self.h.call("POST", "/retries", {"batch_ref": "B-001", "seq": 1},
+                    sensitive=True)
+        self.h.app.forwarder._stop = False
+        self.h.app.forwarder.start()
+        self.h.app.forwarder.kick()
         self.h.wait_until(lambda: self.h.receipt_state("B-001", 1)[0]["state"]
                           == "rejected_terminal")
-        code, err = self.h.call("POST", "/batches/B-001/seal", {},
+        self.h.app.forwarder.stop()
+        code, err = self.h.call("POST", "/batches/B-001/seal",
+                                {"note": "终态阻塞封存复核", "terminal_stage": 2},
                                 expect_error=True)
+        self.h.app.forwarder._stop = False
+        self.h.app.forwarder.start()
         self.assertEqual(err["code"], "batch_not_sealable")
-        self.assertTrue(any(r["code"] == "pending_rejected_terminal"
-                            for r in err["reasons"]))
+        reasons = err["reasons"]
+        self.assertTrue(any(
+            (r.get("code") if isinstance(r, dict) else r) == "pending_rejected_terminal"
+            for r in reasons), err)
 
     # ---- 2. 封存成功：清单/摘要/迁移/回收/审计时间线 ----
     def test_seal_success_moves_hot_data_to_archive(self):
@@ -122,7 +140,7 @@ class ArchiveTests(unittest.TestCase):
         self.assertGreater(audit_before, 0)
 
         status, r = self.h.call("POST", "/batches/B-001/seal",
-                                {"note": "月底空间回收"})
+                                {"note": "月底空间回收"}, sensitive=True)
         self.assertEqual(status, 200)
         self.assertFalse(r["replay"])
         self.assertTrue(r["sealed"])
@@ -171,8 +189,10 @@ class ArchiveTests(unittest.TestCase):
     # ---- 3. 幂等：重复封存返回第一次结果 ----
     def test_seal_replay_returns_first_result(self):
         self.forward_all()
-        _, r1 = self.h.call("POST", "/batches/B-001/seal", {"note": "第一次"})
-        _, r2 = self.h.call("POST", "/batches/B-001/seal", {"note": "第二次"})
+        _, r1 = self.h.call("POST", "/batches/B-001/seal", {"note": "第一次"},
+                            sensitive=True)
+        _, r2 = self.h.call("POST", "/batches/B-001/seal", {"note": "第二次"},
+                            sensitive=True)
         self.assertTrue(r2["replay"])
         self.assertEqual(r2["digest"], r1["digest"])
         self.assertEqual(r2["sealed_at"], r1["sealed_at"])
@@ -193,7 +213,7 @@ class ArchiveTests(unittest.TestCase):
         conn.commit()
         conn.close()
         code, err = self.h.call("POST", "/batches/B-001/seal", {},
-                                expect_error=True)
+                                expect_error=True, sensitive=True)
         self.assertEqual(code, 409)
         self.assertEqual(err["code"], "checksum_mismatch")
         self.assertEqual(err["errors"][0]["seq"], 2)
@@ -208,7 +228,7 @@ class ArchiveTests(unittest.TestCase):
     def test_archived_batch_never_reenters_queue(self):
         self.forward_all()
         calls_before = self.h.call_count()
-        self.h.call("POST", "/batches/B-001/seal", {})
+        self.h.call("POST", "/batches/B-001/seal", {}, sensitive=True)
 
         # 完全相同的历史回执 → 按归档重放原结果
         _, again = self.h.call("POST", "/receipts/batch",
@@ -230,11 +250,11 @@ class ArchiveTests(unittest.TestCase):
         self.assertEqual(err["code"], "batch_archived")
         # 手动重试 / 终态确认重投均被拒
         code, err = self.h.call("POST", "/retries", {"batch_ref": "B-001"},
-                                expect_error=True)
+                                expect_error=True, sensitive=True)
         self.assertEqual(err["code"], "batch_archived")
         code, err = self.h.call(
             "POST", "/batches/B-001/receipts/1/ack-terminal", {},
-            expect_error=True)
+            expect_error=True, sensitive=True)
         self.assertEqual(err["code"], "batch_archived")
 
         # 队列为空；转发器空转若干周期后适配器零新增调用
@@ -247,7 +267,7 @@ class ArchiveTests(unittest.TestCase):
     # ---- 6. 校验并恢复只读详情；篡改归档被拒绝 ----
     def test_archive_verify_and_readonly_restore(self):
         self.forward_all()
-        _, r = self.h.call("POST", "/batches/B-001/seal", {})
+        _, r = self.h.call("POST", "/batches/B-001/seal", {}, sensitive=True)
         _, d = self.h.call("GET", "/archives/B-001")
         self.assertTrue(d["readonly"])
         self.assertTrue(d["verification"]["ok"])
@@ -259,7 +279,7 @@ class ArchiveTests(unittest.TestCase):
         self.assertTrue(d["audit"])
         # 未封存批次无归档
         self.h.call("POST", "/packages/import",
-                    {"package": package("B-009")})
+                    {"package": package("B-009")}, sensitive=True)
         code, err = self.h.call("GET", "/archives/B-009", expect_error=True)
         self.assertEqual(code, 409)
         self.assertEqual(err["code"], "not_archived")
@@ -268,7 +288,7 @@ class ArchiveTests(unittest.TestCase):
 
     def test_archive_tamper_detected_and_rejected(self):
         self.forward_all()
-        self.h.call("POST", "/batches/B-001/seal", {})
+        self.h.call("POST", "/batches/B-001/seal", {}, sensitive=True)
         # 篡改归档正文（不更新摘要）
         conn = sqlite3.connect(self.h.db_path)
         doc = json.loads(conn.execute(
@@ -294,7 +314,7 @@ class ArchiveTests(unittest.TestCase):
     # ---- 7. 下载文档可离线校验 ----
     def test_archive_download_document_verifiable(self):
         self.forward_all()
-        _, r = self.h.call("POST", "/batches/B-001/seal", {})
+        _, r = self.h.call("POST", "/batches/B-001/seal", {}, sensitive=True)
         _, doc = self.h.call("GET", "/archives/B-001/download")
         self.assertEqual(doc["format"], "relay-archive/v1")
         self.assertEqual(doc["digest"], r["digest"])
@@ -307,7 +327,7 @@ class ArchiveTests(unittest.TestCase):
     # ---- 8. 重启恢复与中途失败回滚 ----
     def test_restart_after_seal_restores_archive_state(self):
         self.forward_all()
-        _, r1 = self.h.call("POST", "/batches/B-001/seal", {})
+        _, r1 = self.h.call("POST", "/batches/B-001/seal", {}, sensitive=True)
         db_path, tmp_dir, adapter = self.h.db_path, self.h.tmp, self.h.adapter
         self.h.stop(keep_data=True)
         self.h.tmp = None
@@ -323,7 +343,7 @@ class ArchiveTests(unittest.TestCase):
             self.assertEqual(len(d["receipts"]), 3)
             self.assertTrue(d["audit"])
             # 重复封存仍返回第一次结果
-            _, r2 = h2.call("POST", "/batches/B-001/seal", {})
+            _, r2 = h2.call("POST", "/batches/B-001/seal", {}, sensitive=True)
             self.assertTrue(r2["replay"])
             self.assertEqual(r2["digest"], r1["digest"])
             # 新回执仍被拒，归档记录不回到队列
@@ -348,7 +368,7 @@ class ArchiveTests(unittest.TestCase):
         self.h.app.db.audit = boom
         try:
             code, err = self.h.call("POST", "/batches/B-001/seal", {},
-                                    expect_error=True)
+                                    expect_error=True, sensitive=True)
             self.assertEqual(code, 500)
         finally:
             self.h.app.db.audit = orig_audit
@@ -362,7 +382,7 @@ class ArchiveTests(unittest.TestCase):
         _, s = self.h.call("GET", "/admin/storage")
         self.assertGreater(s["batches"][0]["hot_bytes"], 0)
         # 故障排除后可再次成功封存
-        _, r = self.h.call("POST", "/batches/B-001/seal", {})
+        _, r = self.h.call("POST", "/batches/B-001/seal", {}, sensitive=True)
         self.assertTrue(r["sealed"])
         self.assertFalse(r["replay"])
         _, d = self.h.call("GET", "/batches/B-001")

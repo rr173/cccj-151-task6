@@ -84,19 +84,37 @@ class RelayServerHarness:
             shutil.rmtree(self.tmp, ignore_errors=True)
 
     # ---- HTTP 帮助函数 ----
-    def call(self, method, path, body=None, expect_error=False):
+    def call(self, method, path, body=None, expect_error=False, actor="admin",
+             headers=None, sensitive=False, approver="deputy"):
         data = json.dumps(body).encode() if body is not None else None
-        req = urllib.request.Request(
-            self.base + path, data=data, method=method,
-            headers={"Content-Type": "application/json"} if data else {})
+        hdrs = dict(headers or {})
+        if data:
+            hdrs["Content-Type"] = "application/json"
+        if actor:
+            hdrs["X-Relay-User"] = actor
+        req = urllib.request.Request(self.base + path, data=data, method=method,
+                                     headers=hdrs)
         try:
             with urllib.request.urlopen(req, timeout=5) as resp:
-                return resp.status, json.loads(resp.read().decode())
+                status, payload = resp.status, json.loads(resp.read().decode())
         except urllib.error.HTTPError as e:
             payload = json.loads(e.read().decode())
             if expect_error:
                 return e.code, payload
             raise AssertionError(f"{method} {path} -> {e.code}: {payload}")
+        if sensitive and status == 202 and payload.get("approval_required"):
+            rid = payload["request"]["id"]
+            status, decision = self.call(
+                "POST", f"/approvals/{rid}/approve", {"note": "测试双人复核"},
+                actor=approver, expect_error=expect_error)
+            if expect_error and status >= 400:
+                return status, decision
+            if not decision.get("effective"):
+                raise AssertionError(f"审批未生效: {decision}")
+            return 200, decision.get("execution", decision.get("request", {}))
+        if sensitive and status == 200 and payload.get("replay"):
+            return status, payload
+        return status, payload
 
     def wait_until(self, fn, timeout=5, message=""):
         deadline = time.time() + timeout
@@ -131,21 +149,23 @@ class RelayServerHarness:
 class RelayTests(unittest.TestCase):
     def setUp(self):
         self.h = RelayServerHarness()
-        self.h.call("POST", "/packages/import", {"package": package()})
+        with self.h.app.db.lock:
+            core.import_package(self.h.app.db, package(), actor="test-setup")
 
     def tearDown(self):
         self.h.stop()
 
     # ---- 1. 执行包不可变 / 幂等 ----
     def test_package_idempotent_and_immutable(self):
-        status, d = self.h.call("POST", "/packages/import", {"package": package()})
+        status, d = self.h.call("POST", "/packages/import", {"package": package()},
+                                sensitive=True)
         self.assertEqual(status, 200)
         self.assertTrue(d["replay"])
 
         changed = package()
         changed["items"].append({"household_ref": "H-3"})
         code, err = self.h.call("POST", "/packages/import", {"package": changed},
-                                expect_error=True)
+                                expect_error=True, sensitive=True)
         self.assertEqual(code, 409)
         self.assertEqual(err["code"], "package_conflict")
 
@@ -269,7 +289,7 @@ class RelayTests(unittest.TestCase):
     def test_transient_failure_retried_exactly_once(self):
         self.h.configure({"B-002:1": "fail_then_ok:2"})
         self.h.call("POST", "/packages/import",
-                    {"package": package("B-002")})
+                    {"package": package("B-002")}, sensitive=True)
         self.h.call("POST", "/receipts/batch",
                     batch_upload("B-002", [receipt(1, "T-1")]))
         # 前两次失败、第三次成功（均为同一幂等键）
@@ -301,7 +321,8 @@ class RelayTests(unittest.TestCase):
 
         # 普通重试被拒（必须人工确认终态解除）
         code, err = self.h.call("POST", "/retries",
-                                {"batch_ref": "B-001", "seq": 1}, expect_error=True)
+                                {"batch_ref": "B-001", "seq": 1},
+                                expect_error=True, sensitive=True)
         self.assertEqual(code, 409)
         self.assertEqual(err["code"], "terminal_requires_ack")
 
@@ -315,7 +336,7 @@ class RelayTests(unittest.TestCase):
         # 主系统改回车辆 → 改桩规则为 ack，人工确认重投
         self.h.configure({"*": "ack"}, reset_calls=False)
         self.h.call("POST", "/batches/B-001/receipts/1/ack-terminal",
-                    {"note": "车辆 V-07 已恢复，编排系统确认可重投"})
+                    {"note": "车辆 V-07 已恢复，编排系统确认可重投"}, sensitive=True)
         self.h.wait_until(lambda: self.h.state("B-001")["cursor"] == 3,
                           message="恢复后连续转发到 3")
         d = self.h.state("B-001")
@@ -407,7 +428,8 @@ class RelayTests(unittest.TestCase):
         self.assertEqual(state_now["state"], "retry_wait")
         self.h.configure({"*": "ack"}, reset_calls=False)
         _, d = self.h.call("POST", "/retries",
-                           {"batch_ref": "B-001", "seq": 1, "note": "网络恢复"})
+                           {"batch_ref": "B-001", "seq": 1, "note": "网络恢复"},
+                           sensitive=True)
         self.assertEqual(d["retried"], [1])
         self.h.wait_until(lambda: self.h.receipt_state("B-001", 1)[0]["state"]
                           == "forwarded")
@@ -430,7 +452,7 @@ class RelayTests(unittest.TestCase):
         refs = ["B-C1", "B-C2", "B-C3", "B-C4"]
         for ref in refs:
             self.h.call("POST", "/packages/import",
-                        {"package": package(ref)})
+                        {"package": package(ref)}, sensitive=True)
 
         errors, results = [], []
 

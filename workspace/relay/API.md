@@ -1,7 +1,44 @@
 # 离线车队回执中继 —— API
 
 独立模块，仅依赖 Python 标准库。默认挂载前缀 `/relay`（页面 `/relay/`，接口 `/relay/api/...`）。
-所有写操作在全局锁内串行；后台转发器共用同一把锁。
+所有写操作在全局锁内串行；后台转发器共用同一把锁。除现场终端只读接口外，管理接口用
+`X-Relay-User: <username>` 标识值班账号（也兼容 `X-Operator`）。默认引导账号：
+`admin`/`deputy`（观察+调度+归档审查）、`dispatcher`（观察+调度）、
+`reviewer`（观察+归档审查）、`observer`（仅观察）。
+
+## 岗位权限与双人复核
+
+岗位：`observe`（观察）、`dispatch`（调度）、`archive_review`（归档审查）。
+敏感指令及申请岗位：
+
+| 指令 | 申请岗位 | 批准岗位 |
+|---|---|---|
+| `package_import` 执行包导入 | `dispatch` | `dispatch` |
+| `retry` 失败重试 | `dispatch` | `dispatch` |
+| `terminal_ack` 终态确认重投 | `dispatch` | `dispatch` |
+| `batch_seal` 批次封存 | `archive_review` | `archive_review` |
+
+敏感接口首次请求返回 **202** 和待批事项；完全相同的请求指纹重放返回同一事项或原结果。
+批准必须由**不同账号**完成，且批准瞬间仍满足：双方账号启用、申请人仍有申请岗位、
+批准人有所需岗位、请求未超时、目标资源版本未变化、原业务校验通过。
+`POST /relay/api/approvals/{id}/approve|reject` 均记完整决策；重复/并发批准只有一次
+`effective=1`，后续返回 `409 replay_*` 并追加非生效决策。账号停用/调岗、资源变化、
+超时会把 pending 事项立即置为 `invalid`（动态读取时落库）；已生效动作不回滚。
+默认超时 `RELAY_APPROVAL_TTL_SECONDS=300`。
+
+账号管理（仅同时具备三类岗位的账号）：
+- `GET /relay/api/me`、`GET /relay/api/accounts`
+- `POST /relay/api/accounts`
+  `{"username","display_name?","roles?":["observe","dispatch","archive_review"],
+    "active?":true}`
+
+复核视图：
+- `GET /relay/api/approvals/todo` — 当前账号可批准且非本人发起的未决事项；
+- `GET /relay/api/approvals/mine` — 本人发起事项（含已决/失效）；
+- `GET /relay/api/approvals/invalid` — 已失效、超时、拒绝、执行失败事项；
+- `GET /relay/api/approvals` — 完整待批/决策主表；
+- `GET /relay/api/approvals/{id}` — 单事项详情、资源版本、请求指纹与全部决策；
+- `GET /relay/api/approval-decisions` — 完整决策追加日志（含重复/并发/越权尝试）。
 
 ## 顺序与恰好一次模型
 
@@ -17,13 +54,14 @@
 
 ## 管理/操作 API
 
-### 执行包导入（不可变、幂等）
+### 执行包导入（不可变、幂等；敏感指令需双人复核）
 `POST /relay/api/packages/import`
 ```json
 {"package": {"batch_ref":"B-001","batch_summary":"...","seq_base":1,
              "vehicle":{...},"destination":{...},"items":[...]}}
 ```
-- 201 首次存档；200 `replay:true` 为**完全相同**内容的再次导入（返回原结果）。
+- 201 首次存档（经另一账号批准后）；200 `replay:true` 为**完全相同**内容的再次导入（返回原结果）；
+  202 `approval_required:true` 表示已生成待批事项，尚未执行。
 - 同 `batch_ref` 内容不同 → **409 package_conflict**，原包永不覆盖，记冲突。
 - 必需字段：`batch_ref`、`batch_summary`；`seq_base` 默认 1。
 
@@ -62,13 +100,14 @@
 | `seq > next_seq` | `buffered`，缺口补齐前不转发 |
 | `seq < next_seq` 且无原记录 | 409 `seq_behind_cursor` |
 
-### 队列 / 重试
+### 队列 / 重试（敏感，先进入双人复核）
 - `GET /relay/api/queue` — 所有 queued/buffered/retry_wait/dispatching/终态拒绝行。
 - `POST /relay/api/retries` `{"batch_ref","seq?","note?"}`
-  — 把退避中的失败项立即重新入队；终态拒绝项返回 **409 terminal_requires_ack**。
+  — 申请把退避中的失败项立即重新入队；返回 202 待批，批准后才执行。
+  终态拒绝项的普通执行仍返回 **409 terminal_requires_ack**。
 - `POST /relay/api/batches/{ref}/receipts/{seq}/ack-terminal`
-  `{"note":"..."}` — **人工确认主系统终态已解除**（批次恢复/车辆或目的地改回）
-  后把终态拒绝项重投；全程审计，游标仍按序推进。
+  `{"note":"..."}` — **敏感申请**：人工确认主系统终态已解除后重投；
+  必须由另一调度岗位账号批准。游标仍按序推进。
 
 ### 审计
 - `GET /relay/api/audit` — 审计流：导入/重放/冲突/派发/成功/退避重试/终态拒绝/
@@ -101,10 +140,12 @@
 不可封存时 `reasons[]` 逐条给出原因：`has_gaps`（含缺口序号）、
 `pending_queued/dispatching/retry_wait/buffered/rejected_terminal`。
 
-### 执行封存（幂等，单事务）
+### 执行封存（敏感，申请+不同账号批准；幂等，单事务）
 `POST /relay/api/batches/{ref}/seal` `{"note?":"月底空间回收"}`
-- 200：`{sealed:true, replay:false, digest, manifest, receipt_count, audit_count,
-  freed_bytes, sealed_at}`；重复调用 → `replay:true` 并返回第一次结果。
+- 首次返回 202 待批；批准成功后执行封存并返回：
+  `{sealed:true, replay:false, digest, manifest, receipt_count, audit_count,
+  freed_bytes, sealed_at}`；同请求重复申请/批准保持幂等，封存后重复调用返回
+  `replay:true` 和第一次结果。
 - 进行中批次 → **409 batch_not_sealable**（`reasons[]` 同预估接口）。
 - 封存前完整性校验（逐条重算执行包/回执内容哈希）失败 → **409 checksum_mismatch**
   （`errors[]` 指明不一致的条目），热库数据原样保留。
@@ -156,3 +197,4 @@
 `RELAY_CALLBACK_ADAPTER`(stub|http) `RELAY_CALLBACK_URL`
 `RELAY_CALLBACK_TIMEOUT`(8s) `RELAY_TICK_SECONDS`(1)
 `RELAY_LEASE_SECONDS`(30) `RELAY_BACKOFF_BASE`(1) `RELAY_BACKOFF_CAP`(60)
+`RELAY_APPROVAL_TTL_SECONDS`(300)

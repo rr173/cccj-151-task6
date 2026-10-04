@@ -56,11 +56,13 @@ def wait_up(url, timeout=20):
     raise RuntimeError(f"服务未就绪: {url}")
 
 
-def req(base, method, path, body=None, expect_error=False):
+def req(base, method, path, body=None, expect_error=False, actor="admin"):
     data = json.dumps(body).encode() if body is not None else None
+    headers = {"Content-Type": "application/json"} if data else {}
+    if actor:
+        headers["X-Relay-User"] = actor
     r = urllib.request.Request(
-        base + path, data=data, method=method,
-        headers={"Content-Type": "application/json"} if data else {})
+        base + path, data=data, method=method, headers=headers)
     try:
         with urllib.request.urlopen(r, timeout=10) as resp:
             return resp.status, json.loads(resp.read().decode())
@@ -69,6 +71,22 @@ def req(base, method, path, body=None, expect_error=False):
         if expect_error:
             return e.code, payload
         raise AssertionError(f"{method} {path} -> {e.code}: {payload}")
+
+
+def sensitive_req(base, method, path, body, applicant="dispatcher",
+                  approver="admin", expect_error=False, created_status=200):
+    code, payload = req(base, method, path, body, True, applicant)
+    if code == 202 and payload.get("approval_required"):
+        rid = payload["request"]["id"]
+        code, payload = req(base, "POST", f"/approvals/{rid}/approve",
+                            {"note": "集成测试双人复核"}, True, approver)
+        if code == 200:
+            return created_status, payload.get("execution", payload)
+    if expect_error:
+        return code, payload
+    if code >= 400:
+        raise AssertionError(f"{method} {path} -> {code}: {payload}")
+    return code, payload
 
 
 def wait_for(predicate, timeout=15, message=""):
@@ -139,7 +157,8 @@ def main():
               pkg["batch_summary"] and pkg["vehicle"]["code"] == b1["vehicle_code"]
               and pkg["destination"]["code"] == b1["shelter_code"] and pkg["items"])
 
-        code, imp = req(r, "POST", "/packages/import", {"package": pkg})
+        code, imp = sensitive_req(r, "POST", "/packages/import", {"package": pkg},
+                                  created_status=201)
         check("首次导入 201", code == 201 and not imp["replay"])
         _, imp2 = req(r, "POST", "/packages/import", {"package": pkg})
         check("相同包再次导入幂等重放", imp2["replay"])
@@ -147,7 +166,7 @@ def main():
         # 第二个批次留作终态拒绝场景
         b2 = batches[1]
         _, pkg2 = req(m, "GET", f"/api/execution-package/v1/{b2['id']}")
-        req(r, "POST", "/packages/import", {"package": pkg2})
+        sensitive_req(r, "POST", "/packages/import", {"package": pkg2})
 
         # ---- B. departed 转发 ack → 主系统离场承诺 ----
         print("B. departed 回执 → ack → 离场承诺")
@@ -237,7 +256,7 @@ def main():
         _, d2b = req(r, "GET", f"/batches/{b2['id']}")
         check("重启后 b2 仍终态阻塞", d2b["status"] == "blocked_terminal")
 
-        req(r, "POST", "/packages/import", {"package": pkg3})
+        sensitive_req(r, "POST", "/packages/import", {"package": pkg3})
         req(r, "POST", "/receipts/batch", {"batch_ref": b3["id"], "receipts": [
             {"seq": 1, "receipt_no": "RR-2001", "type": "departed",
              "batch_summary": pkg3["batch_summary"]}]})

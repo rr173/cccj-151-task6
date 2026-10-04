@@ -32,6 +32,18 @@ body {
 }
 .topbar nav button:hover { background: rgba(255, 255, 255, .12); color: #fff; }
 .topbar nav button.active { background: var(--blue); color: #fff; }
+.nav-badge {
+  display: inline-block; min-width: 18px; padding: 0 5px; margin-left: 3px;
+  border-radius: 999px; background: #ef4444; color: #fff; font-size: 11px;
+}
+.authbar {
+  display: flex; align-items: center; gap: 8px; color: #c7d7f5;
+  font-size: 12px;
+}
+.authbar select {
+  color: #0f172a; border: 1px solid #93a5c4; border-radius: 6px;
+  padding: 4px 8px; background: #fff;
+}
 .health { margin-left: auto; font-size: 12px; color: #93c5fd; white-space: nowrap; }
 .health.bad { color: #fca5a5; }
 main { max-width: 1200px; margin: 0 auto; padding: 20px; }
@@ -64,7 +76,7 @@ textarea {
 }
 pre.result {
   background: #0b1220; color: #d7e4ff; padding: 12px; border-radius: 8px;
-  font-size: 12px; min-height: 120px; max-height: 520px; overflow: auto;
+  font-size: 12px; min-height: 80px; max-height: 360px; overflow: auto;
   white-space: pre-wrap; word-break: break-word;
 }
 .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
@@ -133,3 +145,22 @@ code {
   border: 1px solid #bbf7d0; background: var(--green-bg); color: var(--green);
   border-radius: 8px; padding: 10px 12px; margin: 10px 0; font-size: 13px;
 }
+.approval-list { display: grid; gap: 10px; }
+.approval-card {
+  background: #fff; border: 1px solid var(--border); border-left-width: 4px;
+  border-radius: 8px; padding: 12px 14px;
+}
+.approval-card.state-pending { border-left-color: var(--blue); }
+.approval-card.state-executing { border-left-color: #7c3aed; }
+.approval-card.state-approved { border-left-color: var(--green); }
+.approval-card.state-rejected,
+.approval-card.state-invalid,
+.approval-card.state-expired,
+.approval-card.state-failed { border-left-color: var(--red); opacity: .92; }
+.badge.approval-pending { background: var(--blue-bg); color: var(--blue); }
+.badge.approval-executing { background: #f5f3ff; color: #6d28d9; }
+.badge.approval-approved { background: var(--green-bg); color: var(--green); }
+.badge.approval-rejected,
+.badge.approval-invalid,
+.badge.approval-expired,
+.badge.approval-failed { background: var(--red-bg); color: var(--red); }

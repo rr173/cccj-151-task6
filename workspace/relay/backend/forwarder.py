@@ -15,6 +15,7 @@ import random
 import threading
 import time
 
+import approvals
 import core
 
 
@@ -74,6 +75,8 @@ class Forwarder:
     def cycle(self):
         """一个派发周期：领取一个到期项并完成回调终局。返回派发的 (batch,seq) 或 None。"""
         self.stats["cycles"] += 1
+        with self.db.lock:
+            approvals.sweep_pending(self.db)
         claim = self._claim_next()
         if not claim:
             # 到期的 retry_wait 行若到点，_claim_next 已包含；无任务则回收过期租约
@@ -164,6 +167,8 @@ class Forwarder:
                 (r["batch_ref"],)).fetchone()
             advanced = 0
             if cur and cur["next_seq"] == r["seq"]:
+                self._invalidate_pending_approvals(r["batch_ref"], r["seq"],
+                                                   "resource_changed")
                 new_next = r["seq"] + 1
                 self.db.conn.execute(
                     "UPDATE cursors SET next_seq=? WHERE batch_ref=?",
@@ -194,6 +199,8 @@ class Forwarder:
                           detail={"reason": result.code, "detail": result.detail[:500],
                                   "cursor_frozen_at": r["seq"]})
             self.stats["terminal"] += 1
+            self._invalidate_pending_approvals(r["batch_ref"], r["seq"],
+                                               "resource_changed")
 
         else:  # retry —— 瞬时失败，退避后安全重试
             delay = backoff_delay(r["attempts"], self.backoff_base, self.backoff_cap)
@@ -209,6 +216,38 @@ class Forwarder:
             self.stats["retries"] += 1
         self.db.commit()
         self.kick()  # 立即尝试下一个就绪序号（连续转发）
+
+    def _invalidate_pending_approvals(self, batch_ref, seq, reason):
+        """资源状态终局变化时主动失效相关重试/封存待办，不等待下一次周期扫描。"""
+        try:
+            rows = self.db.conn.execute(
+                "SELECT id,action,request_payload FROM approvals"
+                " WHERE state='pending' AND action IN ('retry','terminal_ack','batch_seal')"
+            ).fetchall()
+            for row in rows:
+                try:
+                    payload = json.loads(row["request_payload"])
+                except ValueError:
+                    continue
+                if str(payload.get("batch_ref", "")) != batch_ref:
+                    continue
+                if row["action"] in ("retry", "terminal_ack"):
+                    wanted = payload.get("seq")
+                    if wanted is not None and int(wanted) != int(seq):
+                        continue
+                self.db.conn.execute(
+                    "UPDATE approvals SET state='invalid',invalid_reason=?,"
+                    "decided_at=? WHERE id=? AND state='pending'",
+                    (reason, time.time(), row["id"]))
+                self.db.audit("approval_invalidated", row["action"], batch_ref,
+                              seq=seq, actor="forwarder",
+                              detail={"request_id": row["id"], "reason": reason})
+            self.db.commit()
+        except Exception as e:  # noqa: BLE001 — 失效扫描不能影响转发主流程
+            self.db.conn.rollback()
+            self.db.audit("approval_invalidation_error", batch_ref, seq=seq,
+                          detail={"error": repr(e)})
+            self.db.commit()
 
     # ---- 过期租约回收 ----
     def _reap_expired_leases(self):

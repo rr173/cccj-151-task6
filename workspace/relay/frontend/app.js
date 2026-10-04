@@ -3,6 +3,9 @@ const $ = (id) => document.getElementById(id);
 const API = "/relay/api";
 let timer = null;
 let selectedBatch = null;
+let currentActor = localStorage.getItem("relayActor") || "admin";
+let currentAccount = null;
+let accounts = [];
 
 // ------------------------------------------------------------ 通用
 function toast(msg, kind = "") {
@@ -13,10 +16,17 @@ function toast(msg, kind = "") {
   t.classList.remove("hidden");
 }
 
+function pendingNotice(r) {
+  return `该敏感指令已进入双人复核。\n事项：${r.request?.id || ""}\n` +
+    `指纹：${r.request?.request_fingerprint || ""}\n请由另一个具备对应岗位的账号到「双人复核」页批准。`;
+}
 async function api(path, opts = {}) {
+  const headers = {};
+  if (opts.body) headers["Content-Type"] = "application/json";
+  if (currentActor) headers["X-Relay-User"] = currentActor;
   const resp = await fetch(API + path, {
     method: opts.method || "GET",
-    headers: opts.body ? { "Content-Type": "application/json" } : {},
+    headers,
     body: opts.body ? JSON.stringify(opts.body) : undefined,
   });
   let data = null;
@@ -53,6 +63,182 @@ function stateBadge(s) {
   return `<span class="badge ${s}">${STATE_BADGE[s] || s}</span>`;
 }
 
+// ------------------------------------------------------------ 值班账号与复核
+const ROLE_TEXT = { observe: "观察", dispatch: "调度", archive_review: "归档审查" };
+const ACTION_TEXT = {
+  package_import: "执行包导入", retry: "失败重试",
+  terminal_ack: "终态确认重投", batch_seal: "批次封存",
+};
+const REQ_STATE_TEXT = {
+  pending: "待批准", executing: "执行中", approved: "已批准执行",
+  rejected: "已拒绝", invalid: "已失效", expired: "已超时", failed: "执行被原校验拒绝",
+};
+function reqBadge(s) {
+  return `<span class="badge approval-${esc(s)}">${REQ_STATE_TEXT[s] || esc(s)}</span>`;
+}
+async function loadAccounts() {
+  try {
+    const d = await api("/accounts");
+    accounts = d.accounts;
+    const sel = $("actorSelect");
+    const prev = currentActor;
+    sel.innerHTML = accounts.map((a) =>
+      `<option value="${esc(a.username)}" ${a.username === currentActor ? "selected" : ""}>
+        ${esc(a.display_name)}（${esc(a.username)}）${a.active ? "" : "·停用"}
+      </option>`).join("");
+    if (!accounts.some((a) => a.username === currentActor)) {
+      currentActor = accounts[0]?.username || "admin";
+      sel.value = currentActor;
+    }
+    localStorage.setItem("relayActor", currentActor);
+    currentAccount = accounts.find((a) => a.username === currentActor);
+    $("actorRoles").textContent = currentAccount
+      ? currentAccount.roles.map((r) => ROLE_TEXT[r] || r).join(" / ") : "";
+    document.querySelectorAll("[data-need-role]").forEach((el) => {
+      el.disabled = !canRole(el.dataset.needRole);
+    });
+    if (prev !== currentActor) loadAllForActor();
+  } catch (e) {
+    $("actorRoles").textContent = "账号不可用：" + e.message;
+  }
+}
+$("actorSelect").onchange = async () => {
+  currentActor = $("actorSelect").value;
+  localStorage.setItem("relayActor", currentActor);
+  await loadAccounts();
+  loadHealth(); loadBatches();
+};
+function canRole(role) {
+  return (currentAccount?.roles || []).includes(role);
+}
+function canManageAccounts() {
+  const r = new Set(currentAccount?.roles || []);
+  return ["observe", "dispatch", "archive_review"].every((x) => r.has(x));
+}
+function renderAccountPanel() {
+  if (!canManageAccounts()) {
+    $("accountPanel").innerHTML = `<p class="muted">当前账号可参与与其岗位相符的复核；账号与岗位调整由具备三类岗位的值班管理员执行。</p>`;
+    return;
+  }
+  $("accountPanel").innerHTML = `
+    <div class="card">
+      <h4>账号与岗位</h4>
+      <table class="tbl"><thead><tr><th>账号</th><th>姓名</th><th>岗位</th><th>状态</th><th>操作</th></tr></thead>
+      <tbody>${accounts.map((a) => `<tr>
+        <td><b>${esc(a.username)}</b></td>
+        <td>${esc(a.display_name)}</td>
+        <td>${["observe", "dispatch", "archive_review"].map((r) =>
+          `<label class="chk"><input type="checkbox" data-user="${esc(a.username)}"
+            data-role="${r}" ${a.roles.includes(r) ? "checked" : ""}>${ROLE_TEXT[r]}</label>`).join(" ")}
+        </td><td>${a.active ? "启用" : "<b class='err-text'>停用</b>"}
+          <span class="muted">v${a.role_version}</span></td>
+        <td><button data-save="${esc(a.username)}">保存岗位</button>
+            <button data-toggle="${esc(a.username)}" data-active="${a.active ? 0 : 1}">
+              ${a.active ? "停用" : "启用"}</button></td>
+      </tr>`).join("")}</tbody></table>
+      <p class="hint">保存岗位或停用账号会立即失效该账号相关的未决事项；已经执行成功的动作不回滚。</p>
+    </div>`;
+  $("accountPanel").querySelectorAll("button[data-save]").forEach((b) => b.onclick = async () => {
+    const roles = [...$("accountPanel").querySelectorAll(
+      `input[data-user="${CSS.escape(b.dataset.save)}"]:checked`)].map((x) => x.dataset.role);
+    try {
+      if (!roles.length) return toast("至少保留一个岗位", "err");
+      await api("/accounts", { method: "POST",
+        body: { username: b.dataset.save, roles } });
+      toast("岗位已保存，相关未决事项已按规则失效", "ok"); await loadAccounts(); loadApprovals();
+    } catch (e) { toast(e.data?.error || e.message, "err"); }
+  });
+  $("accountPanel").querySelectorAll("button[data-toggle]").forEach((b) => b.onclick = async () => {
+    const active = b.dataset.active === "1";
+    if (!active && currentActor === b.dataset.toggle) return toast("不能停用当前登录账号", "err");
+    try {
+      await api("/accounts", { method: "POST",
+        body: { username: b.dataset.toggle, active } });
+      toast(active ? "账号已启用" : "账号已停用", "ok"); await loadAccounts(); loadApprovals();
+    } catch (e) { toast(e.data?.error || e.message, "err"); }
+  });
+}
+function requestCard(r, showActions = false) {
+  const p = r.request_payload_obj || {};
+  const rv = r.resource_version_obj || {};
+  return `<div class="approval-card state-${esc(r.state)}">
+    <div class="row between">
+      <b>${ACTION_TEXT[r.action] || r.action} · ${esc(r.resource_ref || p.batch_ref || "")}</b>
+      ${reqBadge(r.state)}
+    </div>
+    <div class="muted">${esc(r.id)} · 申请人 <b>${esc(r.applicant)}</b>
+      · 需要 ${ROLE_TEXT[r.required_role] || r.required_role} · ${fmtTs(r.created_at)}
+      ${r.expires_at ? "· 截止 " + fmtTs(r.expires_at) : ""}</div>
+    ${r.invalid_reason ? `<div class="gapline">失效原因：${esc(r.invalid_reason)}</div>` : ""}
+    <details><summary>请求指纹与资源版本</summary>
+      <p class="mono">fingerprint: ${esc(r.request_fingerprint)}</p>
+      <pre class="result">${esc(JSON.stringify({ request: p, resource_version: rv }, null, 2))}</pre>
+    </details>
+    ${r.result_payload_obj ? `<pre class="result">${esc(JSON.stringify(r.result_payload_obj, null, 2))}</pre>` : ""}
+    ${showActions && r.state === "pending" ? `<div class="row gap">
+      <button class="primary" data-approve="${esc(r.id)}">批准并执行</button>
+      <button class="warn" data-reject="${esc(r.id)}">拒绝</button>
+    </div>` : ""}
+  </div>`;
+}
+async function decide(id, decision) {
+  const note = prompt(decision === "approve" ? "批准备注（将进入完整决策记录）：" : "拒绝原因：",
+                      "双人复核通过") || "";
+  try {
+    await api(`/approvals/${encodeURIComponent(id)}/${decision}`,
+              { method: "POST", body: { note } });
+    toast(decision === "approve" ? "已批准并执行原业务校验" : "已拒绝", "ok");
+  } catch (e) {
+    const data = e.data || {};
+    alert(`${data.error || e.message}\n${data.code ? "code: " + data.code : ""}`);
+  }
+  loadApprovals(); loadBatches(); loadArchiveTabSafe();
+}
+async function loadApprovals() {
+  renderAccountPanel();
+  try {
+    const [todo, mine, invalid, dec] = await Promise.all([
+      api("/approvals/todo"), api("/approvals/mine"),
+      api("/approvals/invalid"), api("/approval-decisions")]);
+    $("approvalTodo").innerHTML = todo.requests.length
+      ? todo.requests.map((r) => requestCard(r, true)).join("")
+      : `<p class="muted">没有需要本人复核的未决事项。</p>`;
+    $("approvalMine").innerHTML = mine.requests.length
+      ? mine.requests.map((r) => requestCard(r, r.state === "pending")).join("")
+      : `<p class="muted">尚未发起敏感指令。</p>`;
+    $("approvalInvalid").innerHTML = invalid.requests.length
+      ? invalid.requests.map((r) => requestCard(r)).join("")
+      : `<p class="muted">暂无失效事项。</p>`;
+    $("decisionRows").innerHTML = dec.decisions.map((d) => `<tr>
+      <td>${fmtTs(d.ts)}</td><td class="mono">${esc(d.request_id.slice(0, 14))}…</td>
+      <td>${ACTION_TEXT[d.action] || d.action}<br><span class="muted">${esc(d.resource_ref)}</span></td>
+      <td>${esc(d.request_applicant)}</td><td>${esc(d.approver)}</td>
+      <td>${d.decision === "approve" ? "批准" : "拒绝"}</td>
+      <td><span class="badge ${d.effective ? "forwarded" : "retry_wait"}">${esc(d.result)}</span></td>
+      <td class="mono">${esc(d.detail)}</td></tr>`).join("");
+    $("approvalTodo").querySelectorAll("button[data-approve]").forEach((b) =>
+      b.onclick = () => decide(b.dataset.approve, "approve"));
+    $("approvalTodo").querySelectorAll("button[data-reject]").forEach((b) =>
+      b.onclick = () => decide(b.dataset.reject, "reject"));
+    $("approvalMine").querySelectorAll("button[data-reject]").forEach((b) =>
+      b.onclick = () => decide(b.dataset.reject, "reject"));
+  } catch (e) {
+    $("approvalTodo").innerHTML = `<p class="err-text">${esc(e.message)}</p>`;
+  }
+}
+async function refreshTodoBadge() {
+  try {
+    const d = await api("/approvals/todo");
+    const b = $("todoBadge");
+    b.textContent = d.requests.length;
+    b.classList.toggle("hidden", d.requests.length === 0);
+  } catch { /* ignore */ }
+}
+function loadArchiveTabSafe() {
+  if (document.getElementById("tab-archive").classList.contains("active")) loadArchiveTab();
+}
+$("approvalRefresh").onclick = loadApprovals;
+
 // ------------------------------------------------------------ Tab 切换
 document.querySelectorAll(".topbar nav button").forEach((btn) => {
   btn.addEventListener("click", () => {
@@ -62,6 +248,7 @@ document.querySelectorAll(".topbar nav button").forEach((btn) => {
     $("tab-" + btn.dataset.tab).classList.add("active");
     if (btn.dataset.tab === "terminal") loadTerminal();
     if (btn.dataset.tab === "retries") loadQueue();
+    if (btn.dataset.tab === "approvals") loadApprovals();
     if (btn.dataset.tab === "archive") loadArchiveTab();
     if (btn.dataset.tab === "audit") loadAudit();
     if (btn.dataset.tab === "stub") loadStub();
@@ -216,7 +403,12 @@ $("importBtn").onclick = async () => {
   try {
     const r = await api("/packages/import", { method: "POST", body: { package: pkg } });
     $("importResult").textContent = JSON.stringify(r, null, 2);
-    toast(r.replay ? "相同包再次导入：返回原结果（幂等）" : "执行包已不可变存档", "ok");
+    if (r.approval_required) {
+      toast("执行包导入已提交双人复核", "ok");
+      alert(pendingNotice(r));
+    } else {
+      toast(r.replay ? "相同包再次导入：返回原结果（幂等）" : "执行包已不可变存档", "ok");
+    }
     loadBatches();
   } catch (e) {
     $("importResult").textContent = JSON.stringify(e.data || { error: e.message }, null, 2);
@@ -278,9 +470,10 @@ async function loadQueue() {
   const d = await api("/queue");
   $("queueRows").innerHTML = d.pending.map((r) => {
     let action = "";
-    if (r.state === "retry_wait" || r.state === "dispatching") {
+    const canDispatch = canRole("dispatch");
+    if ((r.state === "retry_wait" || r.state === "dispatching") && canDispatch) {
       action = `<button data-act="retry" data-ref="${esc(r.batch_ref)}" data-seq="${r.seq}">立即重试</button>`;
-    } else if (r.state === "rejected_terminal") {
+    } else if (r.state === "rejected_terminal" && canDispatch) {
       action = `<button class="warn" data-act="ack" data-ref="${esc(r.batch_ref)}" data-seq="${r.seq}">
         确认终态已解除并重投</button>`;
     } else {
@@ -300,10 +493,14 @@ async function loadQueue() {
       try {
         if (btn.dataset.act === "retry") {
           await api("/retries", { method: "POST",
-            body: { batch_ref: btn.dataset.ref, seq: Number(btn.dataset.seq), note } });
+            body: { batch_ref: btn.dataset.ref, seq: Number(btn.dataset.seq), note } }).then((r) => {
+            if (r.approval_required) alert(pendingNotice(r));
+          });
         } else {
           await api(`/batches/${encodeURIComponent(btn.dataset.ref)}/receipts/${btn.dataset.seq}/ack-terminal`,
-            { method: "POST", body: { note } });
+            { method: "POST", body: { note } }).then((r) => {
+            if (r.approval_required) alert(pendingNotice(r));
+          });
         }
         toast("已提交", "ok");
         loadQueue(); loadBatches();
@@ -334,7 +531,8 @@ async function loadArchiveTab() {
       ? `<span class="badge forwarded">✓ 可封存</span>`
       : `<div class="err-text" style="font-size:12px">${b.reasons.map((r) => esc(r.message)).join("<br>")}</div>`;
     const action = b.sealable
-      ? `<button class="warn" data-ref="${esc(b.batch_ref)}">执行封存</button>`
+      ? `<button class="warn" data-ref="${esc(b.batch_ref)}"
+          ${canRole("archive_review") ? "" : "disabled"}>执行封存</button>`
       : `<span class="muted">—</span>`;
     return `<tr><td><b>${esc(b.batch_ref)}</b></td>
       <td>${b.receipt_count} 条 / ${fmtBytes(b.receipt_bytes)}</td>
@@ -364,6 +562,12 @@ async function sealBatch(ref) {
   try {
     const r = await api(`/batches/${encodeURIComponent(ref)}/seal`,
       { method: "POST", body: { note } });
+    if (r.approval_required) {
+      toast("批次封存已提交双人复核", "ok");
+      alert(pendingNotice(r));
+      loadApprovals();
+      return;
+    }
     toast(r.replay ? "批次此前已封存，返回第一次结果"
                    : `已封存 ${ref}，回收 ${fmtBytes(r.freed_bytes)}`, "ok");
     loadArchiveTab(); loadBatches();
@@ -479,8 +683,10 @@ function armTimer() {
     timer = setInterval(() => {
       loadHealth();
       loadBatches();
+      refreshTodoBadge();
       const active = document.querySelector(".tab.active");
       if (active && active.id === "tab-retries") loadQueue();
+      if (active && active.id === "tab-approvals") loadApprovals();
       if (active && active.id === "tab-archive") loadArchiveTab();
       if (active && active.id === "tab-audit") loadAudit();
     }, 2000);
@@ -488,4 +694,7 @@ function armTimer() {
 }
 $("autoRefresh").onchange = armTimer;
 
-loadHealth(); loadBatches(); armTimer();
+(async function init() {
+  await loadAccounts();
+  loadHealth(); loadBatches(); armTimer(); refreshTodoBadge();
+})();

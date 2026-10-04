@@ -15,10 +15,17 @@
     <button data-tab="terminal">现场终端下载</button>
     <button data-tab="upload">回执上传</button>
     <button data-tab="retries">失败重试</button>
+    <button data-tab="approvals">双人复核 <span id="todoBadge" class="nav-badge hidden">0</span></button>
     <button data-tab="archive">归档封存</button>
     <button data-tab="audit">审计与冲突</button>
     <button data-tab="stub" class="hidden">桩适配器</button>
   </nav>
+  <div class="authbar">
+    <label>值班账号
+      <select id="actorSelect"></select>
+    </label>
+    <span id="actorRoles" class="muted"></span>
+  </div>
   <div class="health" id="health">连接中…</div>
 </header>
 
@@ -48,7 +55,7 @@
         <h3>粘贴执行包 JSON</h3>
         <textarea id="pkgJson" rows="20" placeholder='{"batch_ref":"B-001","batch_summary":"...","seq_base":1,"items":[...]}'></textarea>
         <div class="row gap">
-          <button id="importBtn" class="primary">导入执行包</button>
+          <button id="importBtn" class="primary" data-need-role="dispatch">导入执行包</button>
           <button id="loadSampleBtn">填入示例包</button>
         </div>
       </div>
@@ -103,6 +110,30 @@
       <thead><tr><th>批次</th><th>序号</th><th>回执号</th><th>类型</th><th>状态</th>
         <th>尝试</th><th>失败原因 / 结果</th><th>下次重试</th><th>操作</th></tr></thead>
       <tbody id="queueRows"></tbody>
+    </table>
+  </section>
+
+  <!-- ============ 双人复核 ============ -->
+  <section id="tab-approvals" class="tab">
+    <h2>值班岗位权限与双人复核</h2>
+    <p class="hint">执行包导入、失败重试、终态确认重投、批次封存均先生成带<b>资源版本</b>与
+      <b>请求指纹</b>的待批事项。批准时必须由不同账号、具备对应岗位且资源状态未变化；
+      账号停用/调岗/资源变化/超时会立即失效，已生效动作不回滚。</p>
+    <div id="accountPanel"></div>
+    <div class="row between">
+      <h3>本人待办（待我复核）</h3>
+      <button id="approvalRefresh">刷新</button>
+    </div>
+    <div id="approvalTodo" class="approval-list"></div>
+    <h3>我发起的事项</h3>
+    <div id="approvalMine" class="approval-list"></div>
+    <h3>已失效 / 已拒绝 / 执行失败</h3>
+    <div id="approvalInvalid" class="approval-list"></div>
+    <h3>完整决策记录</h3>
+    <table class="tbl">
+      <thead><tr><th>时间</th><th>事项</th><th>动作</th><th>申请人</th><th>批准人</th>
+        <th>决策</th><th>结果</th><th>细节</th></tr></thead>
+      <tbody id="decisionRows"></tbody>
     </table>
   </section>
 

@@ -112,7 +112,74 @@ CREATE TABLE IF NOT EXISTS archives(
 CREATE INDEX IF NOT EXISTS idx_receipts_dispatch
   ON receipts(state, next_retry_at);
 CREATE INDEX IF NOT EXISTS idx_receipts_batch ON receipts(batch_ref, seq);
+
+-- 值班账号与岗位权限。roles 为 JSON 数组：observe | dispatch | archive_review。
+CREATE TABLE IF NOT EXISTS accounts(
+  username      TEXT PRIMARY KEY,
+  display_name  TEXT NOT NULL DEFAULT '',
+  roles         TEXT NOT NULL DEFAULT '[]',
+  active        INTEGER NOT NULL DEFAULT 1,
+  role_version  INTEGER NOT NULL DEFAULT 1,
+  created_at    REAL NOT NULL,
+  updated_at    REAL NOT NULL,
+  updated_by    TEXT NOT NULL DEFAULT 'system'
+);
+
+-- 敏感指令双人复核待办/决策主表。请求指纹全局唯一，重复请求永远返回同一事项。
+CREATE TABLE IF NOT EXISTS approvals(
+  id                    TEXT PRIMARY KEY,
+  action                TEXT NOT NULL,       -- package_import | retry | terminal_ack | batch_seal
+  resource_ref          TEXT NOT NULL DEFAULT '',
+  request_fingerprint   TEXT NOT NULL UNIQUE,
+  request_payload       TEXT NOT NULL,
+  resource_version      TEXT NOT NULL,       -- 创建时目标资源版本（JSON）
+  resource_snapshot     TEXT NOT NULL,       -- 可重算/比对的完整状态摘要（JSON）
+  state                 TEXT NOT NULL,       -- pending | executing | approved | rejected |
+                                             -- invalid | expired | failed
+  invalid_reason        TEXT NOT NULL DEFAULT '',
+  applicant             TEXT NOT NULL,
+  applicant_roles       TEXT NOT NULL DEFAULT '[]',
+  applicant_role_version INTEGER NOT NULL,
+  required_role         TEXT NOT NULL,
+  approver              TEXT NOT NULL DEFAULT '',
+  decision_note         TEXT NOT NULL DEFAULT '',
+  result_payload        TEXT NOT NULL DEFAULT '',
+  error_code            TEXT NOT NULL DEFAULT '',
+  error_message         TEXT NOT NULL DEFAULT '',
+  created_at            REAL NOT NULL,
+  expires_at            REAL NOT NULL,
+  decision_started_at   REAL,
+  decided_at            REAL,
+  executed_at          REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_approvals_state ON approvals(state, created_at);
+CREATE INDEX IF NOT EXISTS idx_approvals_applicant ON approvals(applicant, created_at);
+CREATE INDEX IF NOT EXISTS idx_approvals_approver ON approvals(approver, decided_at);
+
+-- 每次批准/拒绝尝试均追加；effective=1 的记录至多一条，重复/并发尝试保留为非生效记录。
+CREATE TABLE IF NOT EXISTS approval_decisions(
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  request_id   TEXT NOT NULL,
+  ts           REAL NOT NULL,
+  approver     TEXT NOT NULL,
+  decision     TEXT NOT NULL,                -- approve | reject
+  effective    INTEGER NOT NULL DEFAULT 0,
+  result       TEXT NOT NULL DEFAULT '',     -- effective | replay | self_approval |
+                                             -- unauthorized | stale | invalid | conflict ...
+  detail       TEXT NOT NULL DEFAULT '{}',
+  FOREIGN KEY(request_id) REFERENCES approvals(id)
+);
+CREATE INDEX IF NOT EXISTS idx_approval_decisions_req ON approval_decisions(request_id, id);
 """
+
+DEFAULT_ACCOUNTS = (
+    ("admin", "值班管理员", ["observe", "dispatch", "archive_review"]),
+    ("deputy", "副值班管理员", ["observe", "dispatch", "archive_review"]),
+    ("dispatcher", "调度员", ["observe", "dispatch"]),
+    ("reviewer", "归档审查员", ["observe", "archive_review"]),
+    ("observer", "观察员", ["observe"]),
+)
 
 
 class RelayDB:
@@ -127,7 +194,22 @@ class RelayDB:
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.executescript(SCHEMA)
         self._migrate()
+        self._seed_default_accounts()
         self.conn.commit()
+
+    def _seed_default_accounts(self):
+        exists = self.conn.execute("SELECT COUNT(*) c FROM accounts").fetchone()["c"]
+        if exists:
+            return
+        t = time.time()
+        for username, display_name, roles in DEFAULT_ACCOUNTS:
+            self.conn.execute(
+                "INSERT INTO accounts(username,display_name,roles,active,role_version,"
+                "created_at,updated_at,updated_by) VALUES(?,?,?,1,1,?,?,?)",
+                (username, display_name, json.dumps(roles, ensure_ascii=False),
+                 t, t, "bootstrap"))
+        self.audit("accounts_bootstrapped", actor="bootstrap",
+                   detail={"accounts": [x[0] for x in DEFAULT_ACCOUNTS]})
 
     def _migrate(self):
         """轻量迁移：为既有库补充封存归档所需的列（表由 SCHEMA 幂等创建）。"""
